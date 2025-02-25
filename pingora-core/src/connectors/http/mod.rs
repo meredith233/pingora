@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -61,7 +61,7 @@ impl Connector {
             }
             let h2_only = peer
                 .get_peer_options()
-                .map_or(false, |o| o.alpn.get_min_http_version() == 2)
+                .is_some_and(|o| o.alpn.get_min_http_version() == 2)
                 && !self.h2.h1_is_preferred(peer);
             if !h2_only {
                 // We next check the reuse pool for h1 before creating a new h2 connection.

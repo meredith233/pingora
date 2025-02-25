@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -166,6 +166,20 @@ impl HttpSession {
         Ok(res)
     }
 
+    // Validate the response header read. This function must be called after the response header
+    // read.
+    fn validate_response(&self) -> Result<()> {
+        let resp_header = self
+            .response_header
+            .as_ref()
+            .expect("response header must be read");
+
+        // ad-hoc checks
+        super::common::check_dup_content_length(&resp_header.headers)?;
+
+        Ok(())
+    }
+
     /// Read the response header from the server
     /// This function can be called multiple times, if the headers received are just informational
     /// headers.
@@ -287,6 +301,7 @@ impl HttpSession {
                     self.buf = buf;
                     self.upgraded = self.is_upgrade(&response_header).unwrap_or(false);
                     self.response_header = Some(response_header);
+                    self.validate_response()?;
                     return Ok(s);
                 }
                 HeaderParseState::Partial => { /* continue the loop */ }
@@ -663,6 +678,13 @@ impl HttpSession {
     /// Get the reference of the [Stream] that this HTTP session is operating upon.
     pub fn stream(&self) -> &Stream {
         &self.underlying_stream
+    }
+
+    /// Consume `self`, the underlying [Stream] will be returned and can be used
+    /// directly, for example, in the case of HTTP upgrade. It is not flushed
+    /// prior to being returned.
+    pub fn into_inner(self) -> Stream {
+        self.underlying_stream
     }
 }
 

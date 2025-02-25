@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -120,11 +120,11 @@ where
             // CacheLockGiveUp: the writer will set OriginNotCache (if applicable)
             // readers don't need to do it
             NeverEnabled | StorageError | InternalError | Deferred | CacheLockGiveUp
-            | CacheLockTimeout => {
+            | CacheLockTimeout | DeclinedToUpstream | UpstreamError => {
                 return None;
             }
             // Skip certain NoCacheReason::Custom according to user
-            Custom(reason) if self.skip_custom_reasons_fn.map_or(false, |f| f(reason)) => {
+            Custom(reason) if self.skip_custom_reasons_fn.is_some_and(|f| f(reason)) => {
                 return None;
             }
             Custom(_) | OriginNotCache | ResponseTooLarge => { /* mark uncacheable for these only */

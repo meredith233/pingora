@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,6 +24,9 @@ use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+
+// default maximum upstream retries for retry-able proxy errors
+const DEFAULT_MAX_RETRIES: usize = 16;
 
 /// The configuration file
 ///
@@ -57,6 +60,8 @@ pub struct ServerConf {
     pub group: Option<String>,
     /// How many threads **each** service should get. The threads are not shared across services.
     pub threads: usize,
+    /// Number of listener tasks to use per fd. This allows for parallel accepts.
+    pub listener_tasks_per_fd: usize,
     /// Allow work stealing between threads of the same service. Default `true`.
     pub work_stealing: bool,
     /// The path to CA file the SSL library should use. If empty, the default trust store location
@@ -92,6 +97,11 @@ pub struct ServerConf {
     /// for debugging purposes.
     /// Note: this is an _unstable_ field that may be renamed or removed in the future.
     pub upstream_debug_ssl_keylog: bool,
+    /// The maximum number of retries that will be attempted when an error is
+    /// retry-able (`e.retry() == true`) when proxying to upstream.
+    ///
+    /// This setting is a fail-safe and defaults to 16.
+    pub max_retries: usize,
 }
 
 impl Default for ServerConf {
@@ -109,12 +119,14 @@ impl Default for ServerConf {
             user: None,
             group: None,
             threads: 1,
+            listener_tasks_per_fd: 1,
             work_stealing: true,
             upstream_keepalive_pool_size: 128,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
             grace_period_seconds: None,
             graceful_shutdown_timeout_seconds: None,
+            max_retries: DEFAULT_MAX_RETRIES,
         }
     }
 }
@@ -263,12 +275,14 @@ mod tests {
             user: None,
             group: None,
             threads: 1,
+            listener_tasks_per_fd: 1,
             work_stealing: true,
             upstream_keepalive_pool_size: 4,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
             grace_period_seconds: None,
             graceful_shutdown_timeout_seconds: None,
+            max_retries: 1,
         };
         // cargo test -- --nocapture not_a_test_i_cannot_write_yaml_by_hand
         println!("{}", conf.to_yaml());
@@ -304,6 +318,7 @@ version: 1
         assert_eq!(0, conf.client_bind_to_ipv4.len());
         assert_eq!(0, conf.client_bind_to_ipv6.len());
         assert_eq!(1, conf.version);
+        assert_eq!(DEFAULT_MAX_RETRIES, conf.max_retries);
         assert_eq!("/tmp/pingora.pid", conf.pid_file);
     }
 }

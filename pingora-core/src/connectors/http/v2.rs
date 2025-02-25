@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -85,9 +85,12 @@ impl ConnectionRef {
             release_lock: Arc::new(Mutex::new(())),
         }))
     }
+
     pub fn more_streams_allowed(&self) -> bool {
+        let current = self.0.current_streams.load(Ordering::Relaxed);
         !self.is_shutting_down()
-            && self.0.max_streams > self.0.current_streams.load(Ordering::Relaxed)
+            && self.0.max_streams > current
+            && self.0.connection_stub.0.current_max_send_streams() > current
     }
 
     pub fn is_idle(&self) -> bool {
@@ -373,7 +376,7 @@ impl Connector {
         self.transport
             .preferred_http_version
             .get(peer)
-            .map_or(false, |v| matches!(v, ALPN::H1))
+            .is_some_and(|v| matches!(v, ALPN::H1))
     }
 }
 

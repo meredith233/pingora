@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ use pingora_core::Result;
 use pingora_http::RequestHeader;
 use pingora_proxy::{ProxyHttp, Session};
 
-/// This example shows how to build and import 3rd party modules
+// This example shows how to build and import 3rd party modules
 
 /// A simple ACL to check "Authorization: basic $credential" header
 mod my_acl {

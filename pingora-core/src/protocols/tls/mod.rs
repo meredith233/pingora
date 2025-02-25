@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,6 +22,12 @@ mod boringssl_openssl;
 
 #[cfg(feature = "openssl_derived")]
 pub use boringssl_openssl::*;
+
+#[cfg(feature = "rustls")]
+mod rustls;
+
+#[cfg(feature = "rustls")]
+pub use rustls::*;
 
 #[cfg(not(feature = "any_tls"))]
 pub mod noop_tls;

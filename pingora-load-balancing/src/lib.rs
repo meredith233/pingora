@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -322,7 +322,7 @@ pub struct LoadBalancer<S> {
     pub parallel_health_check: bool,
 }
 
-impl<'a, S: BackendSelection> LoadBalancer<S>
+impl<S: BackendSelection> LoadBalancer<S>
 where
     S: BackendSelection + 'static,
     S::Iter: BackendIter,

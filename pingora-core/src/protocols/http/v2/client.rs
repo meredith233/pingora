@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 // TODO: this module needs a refactor
 
 use bytes::Bytes;
+use futures::FutureExt;
 use h2::client::{self, ResponseFuture, SendRequest};
 use h2::{Reason, RecvStream, SendStream};
 use http::HeaderMap;
@@ -121,7 +122,7 @@ impl Http2Session {
     }
 
     /// Write a request body chunk
-    pub fn write_request_body(&mut self, data: Bytes, end: bool) -> Result<()> {
+    pub async fn write_request_body(&mut self, data: Bytes, end: bool) -> Result<()> {
         if self.ended {
             warn!("Try to write request body after end of stream, dropping the extra data");
             return Ok(());
@@ -132,7 +133,9 @@ impl Http2Session {
             .as_mut()
             .expect("Try to write request body before sending request header");
 
-        write_body(body_writer, data, end).map_err(|e| self.handle_err(e))?;
+        super::write_body(body_writer, data, end)
+            .await
+            .map_err(|e| self.handle_err(e))?;
         self.ended = self.ended || end;
         Ok(())
     }
@@ -194,10 +197,6 @@ impl Http2Session {
             return Ok(None);
         };
 
-        if body_reader.is_end_stream() {
-            return Ok(None);
-        }
-
         let fut = body_reader.data();
         let res = match self.read_timeout {
             Some(t) => timeout(t, fut)
@@ -231,7 +230,43 @@ impl Http2Session {
         // if response_body_reader doesn't exist, the response is not even read yet
         self.response_body_reader
             .as_ref()
-            .map_or(false, |reader| reader.is_end_stream())
+            .is_some_and(|reader| reader.is_end_stream())
+    }
+
+    /// Check whether stream finished with error.
+    /// Like `response_finished`, but also attempts to poll the h2 stream for errors that may have
+    /// caused the stream to terminate, and returns them as `H2Error`s.
+    pub fn check_response_end_or_error(&mut self) -> Result<bool> {
+        let Some(reader) = self.response_body_reader.as_mut() else {
+            // response is not even read
+            return Ok(false);
+        };
+
+        if !reader.is_end_stream() {
+            return Ok(false);
+        }
+
+        // https://github.com/hyperium/h2/issues/806
+        // The fundamental issue is that h2::RecvStream may return `is_end_stream` true
+        // when the stream was naturally closed via END_STREAM /OR/ if there was an error
+        // while reading data frames that forced the closure.
+        // The h2 API as-is makes it difficult to determine which situation is occurring.
+        //
+        // `poll_data` should be returning None after `is_end_stream`, if the stream
+        // is truly expecting no more data to be sent.
+        // https://docs.rs/h2/latest/h2/struct.RecvStream.html#method.is_end_stream
+        // So poll the data once to check this condition. If an error is returned, that indicates
+        // that the stream closed due to an error e.g. h2 protocol error.
+        match reader.data().now_or_never() {
+            Some(None) => Ok(true),
+            Some(Some(Ok(_))) => Error::e_explain(H2Error, "unexpected data after end stream"),
+            Some(Some(Err(e))) => Error::e_because(H2Error, "while checking end stream", e),
+            None => {
+                // RecvStream data() should be ready to poll after the stream ends,
+                // this indicates an unexpected change in the h2 crate
+                panic!("data() not ready after end stream")
+            }
+        }
     }
 
     /// Read the optional trailer headers
@@ -272,6 +307,11 @@ impl Http2Session {
             }
         }
         .or_err(ReadError, "while reading h2 trailers")
+    }
+
+    /// The request header if it is already sent
+    pub fn request_header(&self) -> Option<&RequestHeader> {
+        self.req_sent.as_deref()
     }
 
     /// The response header if it is already read
@@ -356,7 +396,7 @@ impl Http2Session {
             if let Some(err) = e.root_cause().downcast_ref::<h2::Error>() {
                 if err.is_go_away()
                     && err.is_remote()
-                    && err.reason().map_or(false, |r| r == h2::Reason::NO_ERROR)
+                    && (err.reason() == Some(h2::Reason::NO_ERROR))
                 {
                     e.retry = true.into();
                 }
@@ -364,15 +404,6 @@ impl Http2Session {
         }
         e
     }
-}
-
-/// A helper function to write the request body
-pub fn write_body(send_body: &mut SendStream<Bytes>, data: Bytes, end: bool) -> Result<()> {
-    let data_len = data.len();
-    send_body.reserve_capacity(data_len);
-    send_body
-        .send_data(data, end)
-        .or_err(WriteError, "while writing h2 request body")
 }
 
 /* helper functions */
@@ -385,26 +416,16 @@ pub fn write_body(send_body: &mut SendStream<Bytes>, data: Bytes, end: bool) -> 
  5. All other errors will terminate the request
 */
 fn handle_read_header_error(e: h2::Error) -> Box<Error> {
-    if e.is_remote()
-        && e.reason()
-            .map_or(false, |r| r == h2::Reason::HTTP_1_1_REQUIRED)
-    {
+    if e.is_remote() && (e.reason() == Some(h2::Reason::HTTP_1_1_REQUIRED)) {
         let mut err = Error::because(H2Downgrade, "while reading h2 header", e);
         err.retry = true.into();
         err
-    } else if e.is_go_away()
-        && e.is_library()
-        && e.reason()
-            .map_or(false, |r| r == h2::Reason::PROTOCOL_ERROR)
-    {
+    } else if e.is_go_away() && e.is_library() && (e.reason() == Some(h2::Reason::PROTOCOL_ERROR)) {
         // remote send invalid H2 responses
         let mut err = Error::because(InvalidH2, "while reading h2 header", e);
         err.retry = true.into();
         err
-    } else if e.is_go_away()
-        && e.is_remote()
-        && e.reason().map_or(false, |r| r == h2::Reason::NO_ERROR)
-    {
+    } else if e.is_go_away() && e.is_remote() && (e.reason() == Some(h2::Reason::NO_ERROR)) {
         // is_go_away: retry via another connection, this connection is being teardown
         let mut err = Error::because(H2Error, "while reading h2 header", e);
         err.retry = true.into();

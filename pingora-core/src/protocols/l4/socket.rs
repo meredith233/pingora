@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -246,7 +246,6 @@ impl std::net::ToSocketAddrs for SocketAddr {
     }
 }
 
-#[cfg(unix)]
 impl From<StdSockAddr> for SocketAddr {
     fn from(sockaddr: StdSockAddr) -> Self {
         SocketAddr::Inet(sockaddr)

@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@ use pingora_error::{
     ErrorType::{AcceptError, BindError},
     OrErr, Result,
 };
-use std::fs::Permissions;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, ToSocketAddrs};
 #[cfg(unix)]
@@ -27,6 +26,7 @@ use std::os::unix::net::UnixListener as StdUnixListener;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, FromRawSocket};
 use std::time::Duration;
+use std::{fs::Permissions, sync::Arc};
 use tokio::net::TcpSocket;
 
 use crate::protocols::l4::ext::{set_dscp, set_tcp_fastopen_backlog};
@@ -253,53 +253,74 @@ async fn bind(addr: &ServerAddress) -> Result<Listener> {
     }
 }
 
+#[derive(Clone)]
 pub struct ListenerEndpoint {
     listen_addr: ServerAddress,
-    listener: Option<Listener>,
+    listener: Arc<Listener>,
 }
 
-impl ListenerEndpoint {
-    pub fn new(listen_addr: ServerAddress) -> Self {
-        ListenerEndpoint {
-            listen_addr,
-            listener: None,
-        }
+#[derive(Default)]
+pub struct ListenerEndpointBuilder {
+    listen_addr: Option<ServerAddress>,
+}
+
+impl ListenerEndpointBuilder {
+    pub fn new() -> ListenerEndpointBuilder {
+        Self { listen_addr: None }
     }
 
-    pub fn as_str(&self) -> &str {
-        self.listen_addr.as_ref()
+    pub fn listen_addr(&mut self, addr: ServerAddress) -> &mut Self {
+        self.listen_addr = Some(addr);
+        self
     }
 
     #[cfg(unix)]
-    pub async fn listen(&mut self, fds: Option<ListenFds>) -> Result<()> {
-        if self.listener.is_some() {
-            return Ok(());
-        }
+    pub async fn listen(self, fds: Option<ListenFds>) -> Result<ListenerEndpoint> {
+        let listen_addr = self
+            .listen_addr
+            .expect("Tried to listen with no addr specified");
 
         let listener = if let Some(fds_table) = fds {
-            let addr = self.listen_addr.as_ref();
+            let addr_str = listen_addr.as_ref();
+
             // consider make this mutex std::sync::Mutex or OnceCell
             let mut table = fds_table.lock().await;
-            if let Some(fd) = table.get(addr.as_ref()) {
-                from_raw_fd(&self.listen_addr, *fd)?
+
+            if let Some(fd) = table.get(addr_str) {
+                from_raw_fd(&listen_addr, *fd)?
             } else {
                 // not found
-                let listener = bind(&self.listen_addr).await?;
-                table.add(addr.to_string(), listener.as_raw_fd());
+                let listener = bind(&listen_addr).await?;
+                table.add(addr_str.to_string(), listener.as_raw_fd());
                 listener
             }
         } else {
             // not found, no fd table
-            bind(&self.listen_addr).await?
+            bind(&listen_addr).await?
         };
-        self.listener = Some(listener);
-        Ok(())
+
+        Ok(ListenerEndpoint {
+            listen_addr,
+            listener: Arc::new(listener),
+        })
     }
 
     #[cfg(windows)]
-    pub async fn listen(&mut self) -> Result<()> {
-        self.listener = Some(bind(&self.listen_addr).await?);
-        Ok(())
+    pub async fn listen(self) -> Result<ListenerEndpoint> {
+        Ok(ListenerEndpoint {
+            listen_addr,
+            listener: bind(&listen_addr).await?,
+        })
+    }
+}
+
+impl ListenerEndpoint {
+    pub fn builder() -> ListenerEndpointBuilder {
+        ListenerEndpointBuilder::new()
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.listen_addr.as_ref()
     }
 
     fn apply_stream_settings(&self, stream: &mut Stream) -> Result<()> {
@@ -320,12 +341,9 @@ impl ListenerEndpoint {
         Ok(())
     }
 
-    pub async fn accept(&mut self) -> Result<Stream> {
-        let Some(listener) = self.listener.as_mut() else {
-            // panic otherwise this thing dead loop
-            panic!("Need to call listen() first");
-        };
-        let mut stream = listener
+    pub async fn accept(&self) -> Result<Stream> {
+        let mut stream = self
+            .listener
             .accept()
             .await
             .or_err(AcceptError, "Fail to accept()")?;
@@ -341,14 +359,17 @@ mod test {
     #[tokio::test]
     async fn test_listen_tcp() {
         let addr = "127.0.0.1:7100";
-        let mut listener = ListenerEndpoint::new(ServerAddress::Tcp(addr.into(), None));
-        listener
-            .listen(
-                #[cfg(unix)]
-                None,
-            )
-            .await
-            .unwrap();
+
+        let mut builder = ListenerEndpoint::builder();
+
+        builder.listen_addr(ServerAddress::Tcp(addr.into(), None));
+
+        #[cfg(unix)]
+        let listener = builder.listen(None).await.unwrap();
+
+        #[cfg(windows)]
+        let listener = builder.listen().await.unwrap();
+
         tokio::spawn(async move {
             // just try to accept once
             listener.accept().await.unwrap();
@@ -364,14 +385,17 @@ mod test {
             ipv6_only: Some(true),
             ..Default::default()
         });
-        let mut listener = ListenerEndpoint::new(ServerAddress::Tcp("[::]:7101".into(), sock_opt));
-        listener
-            .listen(
-                #[cfg(unix)]
-                None,
-            )
-            .await
-            .unwrap();
+
+        let mut builder = ListenerEndpoint::builder();
+
+        builder.listen_addr(ServerAddress::Tcp("[::]:7101".into(), sock_opt));
+
+        #[cfg(unix)]
+        let listener = builder.listen(None).await.unwrap();
+
+        #[cfg(windows)]
+        let listener = builder.listen().await.unwrap();
+
         tokio::spawn(async move {
             // just try to accept twice
             listener.accept().await.unwrap();
@@ -389,8 +413,13 @@ mod test {
     #[tokio::test]
     async fn test_listen_uds() {
         let addr = "/tmp/test_listen_uds";
-        let mut listener = ListenerEndpoint::new(ServerAddress::Uds(addr.into(), None));
-        listener.listen(None).await.unwrap();
+
+        let mut builder = ListenerEndpoint::builder();
+
+        builder.listen_addr(ServerAddress::Uds(addr.into(), None));
+
+        let listener = builder.listen(None).await.unwrap();
+
         tokio::spawn(async move {
             // just try to accept once
             listener.accept().await.unwrap();

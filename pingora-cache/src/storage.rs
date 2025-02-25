@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -130,6 +130,24 @@ pub trait HandleHit {
         todo!("seek() needs to be implemented")
     }
     // TODO: fn is_stream_hit()
+
+    /// Should we count this hit handler instance as an access in the eviction manager.
+    ///
+    /// Defaults to returning true to track all cache hits as accesses. Customize this if certain
+    /// hits should not affect the eviction system's view of the asset.
+    fn should_count_access(&self) -> bool {
+        true
+    }
+
+    /// Returns the weight of the current cache hit asset to report to the eviction manager.
+    ///
+    /// This allows the eviction system to initialize a weight for the asset, in case it is not
+    /// already tracking it (e.g. storage is out of sync with the eviction manager).
+    ///
+    /// Defaults to 0.
+    fn get_eviction_weight(&self) -> usize {
+        0
+    }
 
     /// Helper function to cast the trait object to concrete types
     fn as_any(&self) -> &(dyn Any + Send + Sync);

@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -46,7 +46,8 @@ fn init() -> bool {
     process::Command::new("pkill")
         .args(["-F", "/tmp/pingora_mock_origin.pid"])
         .spawn()
-        .unwrap();
+        .unwrap()
+        .wait();
     let _origin = thread::spawn(|| {
         process::Command::new("openresty")
             .args(["-p", &format!("{}/origin", super::conf_dir())])

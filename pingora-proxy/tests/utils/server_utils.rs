@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,12 +21,13 @@ use http::HeaderValue;
 use once_cell::sync::Lazy;
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::key::HashBinary;
-use pingora_cache::VarianceBuilder;
+use pingora_cache::lock::CacheKeyLockImpl;
 use pingora_cache::{
     eviction::simple_lru::Manager, filters::resp_cacheable, lock::CacheLock, predictor::Predictor,
     set_compression_dict_path, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason,
     RespCacheable,
 };
+use pingora_cache::{ForcedInvalidationKind, PurgeType, VarianceBuilder};
 use pingora_core::apps::{HttpServerApp, HttpServerOptions};
 use pingora_core::modules::http::compression::ResponseCompression;
 use pingora_core::protocols::{l4::socket::SocketAddr, Digest};
@@ -327,8 +328,8 @@ static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
 const CACHE_DEFAULT: CacheMetaDefaults = CacheMetaDefaults::new(|_| Some(1), 1, 1);
 static CACHE_PREDICTOR: Lazy<Predictor<32>> = Lazy::new(|| Predictor::new(5, None));
 static EVICTION_MANAGER: Lazy<Manager> = Lazy::new(|| Manager::new(8192)); // 8192 bytes
-static CACHE_LOCK: Lazy<CacheLock> =
-    Lazy::new(|| CacheLock::new(std::time::Duration::from_secs(2)));
+static CACHE_LOCK: Lazy<Box<CacheKeyLockImpl>> =
+    Lazy::new(|| CacheLock::new_boxed(std::time::Duration::from_secs(2)));
 // Example of how one might restrict which fields can be varied on.
 static CACHE_VARY_ALLOWED_HEADERS: Lazy<Option<HashSet<&str>>> =
     Lazy::new(|| Some(vec!["accept", "accept-encoding"].into_iter().collect()));
@@ -359,11 +360,18 @@ impl ProxyHttp for ExampleProxyCache {
             .headers
             .get("x-port")
             .map_or("8000", |v| v.to_str().unwrap());
-        let peer = Box::new(HttpPeer::new(
+
+        let mut peer = Box::new(HttpPeer::new(
             format!("127.0.0.1:{}", port),
             false,
             "".to_string(),
         ));
+
+        if session.get_header_bytes("x-h2") == b"true" {
+            // default is 1, 1
+            peer.options.set_http_version(2, 2);
+        }
+
         Ok(peer)
     }
 
@@ -382,7 +390,7 @@ impl ProxyHttp for ExampleProxyCache {
             .req_header()
             .headers
             .get("x-lock")
-            .map(|_| &*CACHE_LOCK);
+            .map(|_| CACHE_LOCK.as_ref());
         session
             .cache
             .enable(&*CACHE_BACKEND, eviction, Some(&*CACHE_PREDICTOR), lock);
@@ -408,12 +416,15 @@ impl ProxyHttp for ExampleProxyCache {
         session: &Session,
         _meta: &CacheMeta,
         _ctx: &mut Self::CTX,
-    ) -> Result<bool> {
-        // allow test header to control force expiry
-        if session.get_header_bytes("x-force-expire") != b"" {
-            return Ok(true);
+    ) -> Result<Option<ForcedInvalidationKind>> {
+        // allow test header to control force expiry/miss
+        if session.get_header_bytes("x-force-miss") != b"" {
+            return Ok(Some(ForcedInvalidationKind::ForceMiss));
         }
-        Ok(false)
+        if session.get_header_bytes("x-force-expire") != b"" {
+            return Ok(Some(ForcedInvalidationKind::ForceExpired));
+        }
+        Ok(None)
     }
 
     fn cache_vary_filter(
@@ -463,7 +474,12 @@ impl ProxyHttp for ExampleProxyCache {
         _ctx: &mut Self::CTX,
     ) -> Result<RespCacheable> {
         let cc = CacheControl::from_resp_headers(resp);
-        Ok(resp_cacheable(cc.as_ref(), resp, false, &CACHE_DEFAULT))
+        Ok(resp_cacheable(
+            cc.as_ref(),
+            resp.clone(),
+            false,
+            &CACHE_DEFAULT,
+        ))
     }
 
     fn upstream_response_filter(

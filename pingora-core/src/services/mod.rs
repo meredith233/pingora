@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -45,6 +45,7 @@ pub trait Service: Sync + Send {
         &mut self,
         #[cfg(unix)] fds: Option<ListenFds>,
         mut shutdown: ShutdownWatch,
+        listeners_per_fd: usize,
     );
 
     /// The name of the service, just for logging and naming the threads assigned to this service

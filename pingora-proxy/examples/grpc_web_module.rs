@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ use pingora_core::{
 };
 use pingora_proxy::{ProxyHttp, Session};
 
-/// This example shows how to use the gRPC-web bridge module
+// This example shows how to use the gRPC-web bridge module
 
 pub struct GrpcWebBridgeProxy;
 

@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,7 +13,12 @@
 // limitations under the License.
 
 use super::*;
-use pingora_cache::{key::HashBinary, CacheKey, CacheMeta, RespCacheable, RespCacheable::*};
+use pingora_cache::{
+    key::HashBinary,
+    CacheKey, CacheMeta, ForcedInvalidationKind,
+    RespCacheable::{self, *},
+};
+use proxy_cache::range_filter::{self};
 use std::time::Duration;
 
 /// The interface to control the HTTP proxy
@@ -129,21 +134,23 @@ pub trait ProxyHttp {
         session.cache.cache_miss();
     }
 
-    /// This filter is called after a successful cache lookup and before the cache asset is ready to
-    /// be used.
+    /// This filter is called after a successful cache lookup and before the
+    /// cache asset is ready to be used.
     ///
-    /// This filter allow the user to log or force expire the asset.
-    // flex purge, other filtering, returns whether asset is should be force expired or not
+    /// This filter allows the user to log or force invalidate the asset.
+    ///
+    /// The value returned indicates if the force invalidation should be used,
+    /// and which kind. Returning `None` indicates no forced invalidation
     async fn cache_hit_filter(
         &self,
         _session: &Session,
         _meta: &CacheMeta,
         _ctx: &mut Self::CTX,
-    ) -> Result<bool>
+    ) -> Result<Option<ForcedInvalidationKind>>
     where
         Self::CTX: Send + Sync,
     {
-        Ok(false)
+        Ok(None)
     }
 
     /// Decide if a request should continue to upstream after not being served from cache.
@@ -210,6 +217,23 @@ pub trait ProxyHttp {
         )
     }
 
+    /// This filter is called when cache is enabled to determine what byte range to return (in both
+    /// cache hit and miss cases) from the response body. It is only used when caching is enabled,
+    /// otherwise the upstream is responsible for any filtering. It allows users to define the range
+    /// this request is for via its return type `range_filter::RangeType`.
+    ///
+    /// It also allow users to modify the response header accordingly.
+    ///
+    /// The default implementation can handle a single-range as per [RFC7232].
+    fn range_header_filter(
+        &self,
+        req: &RequestHeader,
+        resp: &mut ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> range_filter::RangeType {
+        proxy_cache::range_filter::range_header_filter(req, resp)
+    }
+
     /// Modify the request before it is sent to the upstream
     ///
     /// Unlike [Self::request_filter()], this filter allows to change the request headers to send
@@ -267,7 +291,8 @@ pub trait ProxyHttp {
         _body: &mut Option<Bytes>,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
-    ) {
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Similar to [Self::upstream_response_filter()] but for response trailers
@@ -366,12 +391,19 @@ pub trait ProxyHttp {
     ///
     /// Users may write an error response to the downstream if the downstream is still writable.
     ///
-    /// The response status code of the error response maybe returned for logging purpose.
-    async fn fail_to_proxy(&self, session: &mut Session, e: &Error, _ctx: &mut Self::CTX) -> u16
+    /// The response status code of the error response may be returned for logging purposes.
+    /// Additionally, the user can return whether this session may be reused in spite of the error.
+    /// Today this reuse status is only respected for errors that occur prior to upstream peer
+    /// selection, and the keepalive configured on the `Session` itself still takes precedent.
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &Error,
+        _ctx: &mut Self::CTX,
+    ) -> FailToProxy
     where
         Self::CTX: Send + Sync,
     {
-        let server_session = session.as_mut();
         let code = match e.etype() {
             HTTPStatus(code) => *code,
             _ => {
@@ -391,9 +423,16 @@ pub trait ProxyHttp {
             }
         };
         if code > 0 {
-            server_session.respond_error(code).await
+            session.respond_error(code).await.unwrap_or_else(|e| {
+                error!("failed to send error response to downstream: {e}");
+            });
         }
-        code
+
+        FailToProxy {
+            error_code: code,
+            // default to no reuse, which is safest
+            can_reuse_downstream: false,
+        }
     }
 
     /// Decide whether should serve stale when encountering an error or during revalidation
@@ -414,7 +453,7 @@ pub trait ProxyHttp {
         // it is disconnected
         // or doing so is explicitly permitted by the client or origin server
         // (e.g. headers or an out-of-band contract)
-        error.map_or(false, |e| e.esource() == &ErrorSource::Upstream)
+        error.is_some_and(|e| e.esource() == &ErrorSource::Upstream)
     }
 
     /// This filter is called when the request just established or reused a connection to the upstream
@@ -466,4 +505,10 @@ pub trait ProxyHttp {
     ) -> Result<()> {
         Ok(())
     }
+}
+
+/// Context struct returned by `fail_to_proxy`.
+pub struct FailToProxy {
+    pub error_code: u16,
+    pub can_reuse_downstream: bool,
 }

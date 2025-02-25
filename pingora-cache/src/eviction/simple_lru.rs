@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -142,7 +142,7 @@ struct InsertToManager<'a> {
     lru: &'a Manager,
 }
 
-impl<'de, 'a> serde::de::Visitor<'de> for InsertToManager<'a> {
+impl<'de> serde::de::Visitor<'de> for InsertToManager<'_> {
     type Value = ();
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {

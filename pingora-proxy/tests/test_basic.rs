@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -267,6 +267,30 @@ async fn test_h2_to_h1_upload() {
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
     let body = res.text().await.unwrap();
     assert_eq!(body, payload);
+}
+
+#[tokio::test]
+#[cfg(feature = "any_tls")]
+async fn test_h2_head() {
+    init();
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+
+    let res = client
+        .head("https://127.0.0.1:6150/set_content_length")
+        .header("sni", "openrusty.org")
+        .header("x-h2", "true")
+        .header("x-set-content-length", "11")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.version(), reqwest::Version::HTTP_2);
+    let body = res.text().await.unwrap();
+    // should not be any body, despite content-length
+    assert_eq!(body, "");
 }
 
 #[cfg(unix)]
@@ -566,7 +590,7 @@ async fn test_tls_underscore_non_sub_sni_verify_host() {
     assert_eq!(headers[header::CONNECTION], "close");
 }
 
-#[cfg(feature = "any_tls")]
+#[cfg(feature = "openssl_derived")]
 #[tokio::test]
 async fn test_tls_alt_verify_host() {
     init();
@@ -585,7 +609,7 @@ async fn test_tls_alt_verify_host() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
-#[cfg(feature = "any_tls")]
+#[cfg(feature = "openssl_derived")]
 #[tokio::test]
 async fn test_tls_underscore_sub_alt_verify_host() {
     init();

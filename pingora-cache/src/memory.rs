@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -206,6 +206,23 @@ impl HandleHit for MemHitHandler {
         }
     }
 
+    fn should_count_access(&self) -> bool {
+        match self {
+            // avoid counting accesses for partial reads to keep things simple
+            Self::Complete(_) => true,
+            Self::Partial(_) => false,
+        }
+    }
+
+    fn get_eviction_weight(&self) -> usize {
+        match self {
+            // FIXME: just body size, also track meta size
+            Self::Complete(c) => c.body.len(),
+            // partial read cannot be estimated since body size is unknown
+            Self::Partial(_) => 0,
+        }
+    }
+
     fn as_any(&self) -> &(dyn Any + Send + Sync) {
         self
     }
@@ -405,8 +422,8 @@ impl Storage for MemCache {
 #[cfg(test)]
 mod test {
     use super::*;
+    use cf_rustracing::span::Span;
     use once_cell::sync::Lazy;
-    use rustracing::span::Span;
 
     fn gen_meta() -> CacheMeta {
         let mut header = ResponseHeader::build(200, None).unwrap();

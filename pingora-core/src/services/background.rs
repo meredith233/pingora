@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -71,6 +71,7 @@ where
         &mut self,
         #[cfg(unix)] _fds: Option<ListenFds>,
         shutdown: ShutdownWatch,
+        _listeners_per_fd: usize,
     ) {
         self.task.start(shutdown).await;
     }

@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -44,6 +44,7 @@ pub trait TlsAccept {
     /// This function is called in the middle of a TLS handshake. Structs who
     /// implement this function should provide tls certificate and key to the
     /// [TlsRef] via `ssl_use_certificate` and `ssl_use_private_key`.
+    /// Note. This is only supported for openssl and boringssl
     async fn certificate_callback(&self, _ssl: &mut TlsRef) -> () {
         // does nothing by default
     }
@@ -57,21 +58,31 @@ struct TransportStackBuilder {
 }
 
 impl TransportStackBuilder {
-    pub fn build(&mut self, #[cfg(unix)] upgrade_listeners: Option<ListenFds>) -> TransportStack {
-        TransportStack {
-            l4: ListenerEndpoint::new(self.l4.clone()),
+    pub async fn build(
+        &mut self,
+        #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
+    ) -> Result<TransportStack> {
+        let mut builder = ListenerEndpoint::builder();
+
+        builder.listen_addr(self.l4.clone());
+
+        #[cfg(unix)]
+        let l4 = builder.listen(upgrade_listeners).await?;
+
+        #[cfg(windows)]
+        let l4 = builder.listen().await?;
+
+        Ok(TransportStack {
+            l4,
             tls: self.tls.take().map(|tls| Arc::new(tls.build())),
-            #[cfg(unix)]
-            upgrade_listeners,
-        }
+        })
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct TransportStack {
     l4: ListenerEndpoint,
     tls: Option<Arc<Acceptor>>,
-    // listeners sent from the old process for graceful upgrade
-    upgrade_listeners: Option<ListenFds>,
 }
 
 impl TransportStack {
@@ -79,16 +90,7 @@ impl TransportStack {
         self.l4.as_str()
     }
 
-    pub async fn listen(&mut self) -> Result<()> {
-        self.l4
-            .listen(
-                #[cfg(unix)]
-                self.upgrade_listeners.take(),
-            )
-            .await
-    }
-
-    pub async fn accept(&mut self) -> Result<UninitializedStream> {
+    pub async fn accept(&self) -> Result<UninitializedStream> {
         let stream = self.l4.accept().await?;
         Ok(UninitializedStream {
             l4: stream,
@@ -107,7 +109,8 @@ pub(crate) struct UninitializedStream {
 }
 
 impl UninitializedStream {
-    pub async fn handshake(self) -> Result<Stream> {
+    pub async fn handshake(mut self) -> Result<Stream> {
+        self.l4.set_buffer();
         if let Some(tls) = self.tls {
             let tls_stream = tls.tls_handshake(self.l4).await?;
             Ok(Box::new(tls_stream))
@@ -197,19 +200,24 @@ impl Listeners {
         self.stacks.push(TransportStackBuilder { l4, tls })
     }
 
-    pub(crate) fn build(
+    pub(crate) async fn build(
         &mut self,
         #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
-    ) -> Vec<TransportStack> {
-        self.stacks
-            .iter_mut()
-            .map(|b| {
-                b.build(
+    ) -> Result<Vec<TransportStack>> {
+        let mut stacks = Vec::with_capacity(self.stacks.len());
+
+        for b in self.stacks.iter_mut() {
+            let new_stack = b
+                .build(
                     #[cfg(unix)]
                     upgrade_listeners.clone(),
                 )
-            })
-            .collect()
+                .await?;
+
+            stacks.push(new_stack);
+        }
+
+        Ok(stacks)
     }
 
     pub(crate) fn cleanup(&self) {
@@ -232,14 +240,17 @@ mod test {
         let mut listeners = Listeners::tcp(addr1);
         listeners.add_tcp(addr2);
 
-        let listeners = listeners.build(
-            #[cfg(unix)]
-            None,
-        );
+        let listeners = listeners
+            .build(
+                #[cfg(unix)]
+                None,
+            )
+            .await
+            .unwrap();
+
         assert_eq!(listeners.len(), 2);
-        for mut listener in listeners {
+        for listener in listeners {
             tokio::spawn(async move {
-                listener.listen().await.unwrap();
                 // just try to accept once
                 let stream = listener.accept().await.unwrap();
                 stream.handshake().await.unwrap();
@@ -262,16 +273,17 @@ mod test {
         let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
         let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
         let mut listeners = Listeners::tls(addr, &cert_path, &key_path).unwrap();
-        let mut listener = listeners
+        let listener = listeners
             .build(
                 #[cfg(unix)]
                 None,
             )
+            .await
+            .unwrap()
             .pop()
             .unwrap();
 
         tokio::spawn(async move {
-            listener.listen().await.unwrap();
             // just try to accept once
             let stream = listener.accept().await.unwrap();
             let mut stream = stream.handshake().await.unwrap();

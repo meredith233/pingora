@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -91,6 +91,7 @@ impl SocketDigest {
             raw_sock,
             peer_addr: OnceCell::new(),
             local_addr: OnceCell::new(),
+            original_dst: OnceCell::new(),
         }
     }
 
