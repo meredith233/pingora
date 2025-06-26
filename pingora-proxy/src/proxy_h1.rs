@@ -62,6 +62,7 @@ impl<SV> HttpProxy<SV> {
                 session.cache.disable(NoCacheReason::InternalError);
                 warn!("cache upstream filter error {}, disabling cache", e);
             }
+            session.mark_upstream_headers_mutated_for_cache();
         }
 
         match self
@@ -154,6 +155,7 @@ impl<SV> HttpProxy<SV> {
     {
         let mut request_done = false;
         let mut response_done = false;
+        let mut send_error = None;
 
         /* duplex mode, wait for either to complete */
         while !request_done || !response_done {
@@ -178,7 +180,7 @@ impl<SV> HttpProxy<SV> {
                         Err(e) => {
                             // Push the error to downstream and then quit
                             // Don't care if send fails: downstream already gone
-                            let _ = tx.send(HttpTask::Failed(e.into_up())).await;
+                            let _ = tx.send(HttpTask::Failed(send_error.unwrap_or(e).into_up())).await;
                             // Downstream should consume all remaining data and handle the error
                             return Ok(())
                         }
@@ -186,10 +188,20 @@ impl<SV> HttpProxy<SV> {
                 },
 
                 body = rx.recv(), if !request_done => {
-                    request_done = send_body_to1(client_session, body).await?;
-                    // An upgraded request is terminated when either side is done
-                    if request_done && client_session.is_upgrade_req() {
-                        response_done = true;
+                    match send_body_to1(client_session, body).await {
+                        Ok(send_done) => {
+                            request_done = send_done;
+                            // An upgraded request is terminated when either side is done
+                            if request_done && client_session.is_upgrade_req() {
+                                response_done = true;
+                            }
+                        },
+                        Err(e) => {
+                           debug!("send error, draining read buf: {e}");
+                           request_done = true;
+                           send_error = Some(e);
+                           continue
+                        }
                     }
                 },
 
@@ -331,7 +343,8 @@ impl<SV> HttpProxy<SV> {
                         // pull as many tasks as we can
                         let mut tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
                         tasks.push(t);
-                        while let Some(maybe_task) = rx.recv().now_or_never() {
+                        // tokio::task::unconstrained because now_or_never may yield None when the future is ready
+                        while let Some(maybe_task) = tokio::task::unconstrained(rx.recv()).now_or_never() {
                             debug!("upstream event now: {:?}", maybe_task);
                             if let Some(t) = maybe_task {
                                 tasks.push(t);
@@ -481,10 +494,9 @@ impl<SV> HttpProxy<SV> {
 
         match task {
             HttpTask::Header(mut header, end) => {
-                /* Downstream revalidation/range, only needed when cache is on because otherwise origin
+                /* Downstream revalidation/range, only needed when cache modified headers because otherwise origin
                  * will handle it */
-                // TODO: if cache is disabled during response phase, we should still do the filter
-                if session.cache.enabled() {
+                if session.upstream_headers_mutated_for_cache() {
                     self.downstream_response_conditional_filter(
                         serve_from_cache,
                         session,
@@ -492,9 +504,7 @@ impl<SV> HttpProxy<SV> {
                         ctx,
                     );
                     if !session.ignore_downstream_range {
-                        let range_type =
-                            self.inner
-                                .range_header_filter(session.req_header(), &mut header, ctx);
+                        let range_type = self.inner.range_header_filter(session, &mut header, ctx);
                         range_body_filter.set(range_type);
                     }
                 }

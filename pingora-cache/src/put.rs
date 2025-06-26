@@ -108,11 +108,16 @@ impl<C: CachePut> CachePutCtx<C> {
             // no miss_handler, uncacheable
             return Ok(());
         };
-        let size = miss_handler.finish().await?;
+        let finish = miss_handler.finish().await?;
         if let Some(eviction) = self.eviction.as_ref() {
             let cache_key = self.key.to_compact();
             let meta = self.meta.as_ref().unwrap();
-            let evicted = eviction.admit(cache_key, size, meta.0.internal.fresh_until);
+            let evicted = match finish {
+                MissFinishType::Appended(delta) => eviction.increment_weight(cache_key, delta),
+                MissFinishType::Created(size) => {
+                    eviction.admit(cache_key, size, meta.0.internal.fresh_until)
+                }
+            };
             // actual eviction can be done async
             let trace = self
                 .trace
@@ -201,7 +206,8 @@ mod test {
     struct TestCachePut();
     impl CachePut for TestCachePut {
         fn cache_defaults() -> &'static CacheMetaDefaults {
-            const DEFAULT: CacheMetaDefaults = CacheMetaDefaults::new(|_| Some(1), 1, 1);
+            const DEFAULT: CacheMetaDefaults =
+                CacheMetaDefaults::new(|_| Some(Duration::from_secs(1)), 1, 1);
             &DEFAULT
         }
     }

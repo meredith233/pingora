@@ -275,10 +275,18 @@ impl<SV> HttpProxy<SV> {
                         }
                     };
                     let is_body_done = session.is_body_done();
-                    let request_done =
-                        self.send_body_to2(session, body, is_body_done, client_body, ctx)
-                        .await?;
-                    downstream_state.maybe_finished(request_done);
+                    match self.send_body_to2(session, body, is_body_done, client_body, ctx).await {
+                        Ok(request_done) =>  {
+                            downstream_state.maybe_finished(request_done);
+                        },
+                        Err(e) => {
+                            // mark request done, attempt to drain receive
+                            warn!("Upstream h2 body send error: {e}");
+                            // upstream is what actually errored but we don't want to continue
+                            // polling the downstream body
+                            downstream_state.to_errored();
+                        }
+                    };
                 },
 
                 task = rx.recv(), if !response_state.upstream_done() => {
@@ -291,7 +299,8 @@ impl<SV> HttpProxy<SV> {
                         // pull as many tasks as we can
                         let mut tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
                         tasks.push(t);
-                        while let Some(maybe_task) = rx.recv().now_or_never() {
+                        // tokio::task::unconstrained because now_or_never may yield None when the future is ready
+                        while let Some(maybe_task) = tokio::task::unconstrained(rx.recv()).now_or_never() {
                             if let Some(t) = maybe_task {
                                 tasks.push(t);
                             } else {
@@ -343,6 +352,8 @@ impl<SV> HttpProxy<SV> {
                     let task = self.h2_response_filter(session, task?, ctx,
                         &mut serve_from_cache,
                         &mut range_body_filter, true).await?;
+                    debug!("serve_from_cache task {task:?}");
+
                     match session.write_response_tasks(vec![task]).await {
                         Ok(b) => response_state.maybe_set_cache_done(b),
                         Err(e) => if serve_from_cache.is_miss() {
@@ -433,12 +444,9 @@ impl<SV> HttpProxy<SV> {
 
         match task {
             HttpTask::Header(mut header, eos) => {
-                let req = session.req_header();
-
                 /* Downstream revalidation, only needed when cache is on because otherwise origin
                  * will handle it */
-                // TODO: if cache is disabled during response phase, we should still do the filter
-                if session.cache.enabled() {
+                if session.upstream_headers_mutated_for_cache() {
                     self.downstream_response_conditional_filter(
                         serve_from_cache,
                         session,
@@ -446,7 +454,7 @@ impl<SV> HttpProxy<SV> {
                         ctx,
                     );
                     if !session.ignore_downstream_range {
-                        let range_type = self.inner.range_header_filter(req, &mut header, ctx);
+                        let range_type = self.inner.range_header_filter(session, &mut header, ctx);
                         range_body_filter.set(range_type);
                     }
                 }

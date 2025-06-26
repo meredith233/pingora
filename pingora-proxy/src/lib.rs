@@ -49,7 +49,9 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time;
 
 use pingora_cache::NoCacheReason;
-use pingora_core::apps::{HttpServerApp, HttpServerOptions};
+use pingora_core::apps::{
+    HttpPersistentSettings, HttpServerApp, HttpServerOptions, ReusedHttpStream,
+};
 use pingora_core::connectors::{http::Connector, ConnectorOptions};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
@@ -253,7 +255,7 @@ impl<SV> HttpProxy<SV> {
     {
         match task {
             HttpTask::Header(header, _eos) => {
-                self.inner.upstream_response_filter(session, header, ctx)
+                self.inner.upstream_response_filter(session, header, ctx)?
             }
             HttpTask::Body(data, eos) => self
                 .inner
@@ -274,7 +276,7 @@ impl<SV> HttpProxy<SV> {
         ctx: &mut SV::CTX,
         reuse: bool,
         error: Option<&Error>,
-    ) -> Option<Stream>
+    ) -> Option<ReusedHttpStream>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
@@ -283,7 +285,14 @@ impl<SV> HttpProxy<SV> {
 
         if reuse {
             // TODO: log error
-            session.downstream_session.finish().await.ok().flatten()
+            let persistent_settings = HttpPersistentSettings::for_session(&session);
+            session
+                .downstream_session
+                .finish()
+                .await
+                .ok()
+                .flatten()
+                .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)))
         } else {
             None
         }
@@ -312,6 +321,8 @@ pub struct Session {
     pub upstream_compression: ResponseCompressionCtx,
     /// ignore downstream range (skip downstream range filters)
     pub ignore_downstream_range: bool,
+    /// Were the upstream request headers modified?
+    pub upstream_headers_mutated_for_cache: bool,
     // the context from parent request
     pub subrequest_ctx: Option<Box<SubReqCtx>>,
     // Downstream filter modules
@@ -329,6 +340,7 @@ impl Session {
             // disable both upstream and downstream compression
             upstream_compression: ResponseCompressionCtx::new(0, false, false),
             ignore_downstream_range: false,
+            upstream_headers_mutated_for_cache: false,
             subrequest_ctx: None,
             downstream_modules_ctx: downstream_modules.build_ctx(),
         }
@@ -431,10 +443,34 @@ impl Session {
                         *task = HttpTask::Body(Some(buf), true);
                     }
                 }
-                _ => { /* Done or Failed */ }
+                HttpTask::Done => {
+                    // `Done` can be sent in certain response paths to mark end
+                    // of response if not already done via trailers or body with
+                    // end flag set.
+                    // If the filter returns body bytes on Done,
+                    // write them into the response.
+                    //
+                    // Note, this will not work if end of stream has already
+                    // been seen or we've written content-length bytes.
+                    if let Some(buf) = self.downstream_modules_ctx.response_done_filter()? {
+                        *task = HttpTask::Body(Some(buf), true);
+                    }
+                }
+                _ => { /* Failed */ }
             }
         }
         self.downstream_session.response_duplex_vec(tasks).await
+    }
+
+    /// Mark the upstream headers as modified by caching. This should lead to range filters being
+    /// skipped when responding to the downstream.
+    pub fn mark_upstream_headers_mutated_for_cache(&mut self) {
+        self.upstream_headers_mutated_for_cache = true;
+    }
+
+    /// Check whether the upstream headers were marked as mutated during the request.
+    pub fn upstream_headers_mutated_for_cache(&self) -> bool {
+        self.upstream_headers_mutated_for_cache
     }
 }
 
@@ -483,7 +519,7 @@ impl<SV> HttpProxy<SV> {
         self: &Arc<Self>,
         mut session: Session,
         mut ctx: <SV as ProxyHttp>::CTX,
-    ) -> Option<Stream>
+    ) -> Option<ReusedHttpStream>
     where
         SV: ProxyHttp + Send + Sync + 'static,
         <SV as ProxyHttp>::CTX: Send + Sync,
@@ -522,7 +558,14 @@ impl<SV> HttpProxy<SV> {
                     // TODO: log error
                     self.inner.logging(&mut session, None, &mut ctx).await;
                     self.cleanup_sub_req(&mut session);
-                    return session.downstream_session.finish().await.ok().flatten();
+                    let persistent_settings = HttpPersistentSettings::for_session(&session);
+                    return session
+                        .downstream_session
+                        .finish()
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)));
                 }
                 /* else continue */
             }
@@ -572,7 +615,7 @@ impl<SV> HttpProxy<SV> {
                         }
                     }
 
-                    return self.finish(session, &mut ctx, false, None).await;
+                    return self.finish(session, &mut ctx, true, None).await;
                 }
                 /* else continue */
             }
@@ -679,7 +722,7 @@ impl<SV> HttpProxy<SV> {
         ctx: &mut <SV as ProxyHttp>::CTX,
         e: Box<Error>,
         context: &str,
-    ) -> Option<Stream>
+    ) -> Option<ReusedHttpStream>
     where
         SV: ProxyHttp + Send + Sync + 'static,
         <SV as ProxyHttp>::CTX: Send + Sync,
@@ -697,7 +740,14 @@ impl<SV> HttpProxy<SV> {
         self.cleanup_sub_req(&mut session);
 
         if res.can_reuse_downstream {
-            session.downstream_session.finish().await.ok().flatten()
+            let persistent_settings = HttpPersistentSettings::for_session(&session);
+            session
+                .downstream_session
+                .finish()
+                .await
+                .ok()
+                .flatten()
+                .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)))
         } else {
             None
         }
@@ -760,23 +810,15 @@ where
     async fn process_new_http(
         self: &Arc<Self>,
         session: HttpSession,
-        shutdown: &ShutdownWatch,
-    ) -> Option<Stream> {
+        _shutdown: &ShutdownWatch,
+    ) -> Option<ReusedHttpStream> {
         let session = Box::new(session);
 
         // TODO: keepalive pool, use stack
-        let mut session = match self.handle_new_request(session).await {
+        let session = match self.handle_new_request(session).await {
             Some(downstream_session) => Session::new(downstream_session, &self.downstream_modules),
             None => return None, // bad request
         };
-
-        if *shutdown.borrow() {
-            // stop downstream from reusing if this service is shutting down soon
-            session.set_keepalive(None);
-        } else {
-            // default 60s
-            session.set_keepalive(Some(60));
-        }
 
         let ctx = self.inner.new_ctx();
         self.process_request(session, ctx).await

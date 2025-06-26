@@ -15,7 +15,7 @@
 use super::*;
 use pingora_cache::{
     key::HashBinary,
-    CacheKey, CacheMeta, ForcedInvalidationKind,
+    CacheKey, CacheMeta, ForcedInvalidationKind, HitHandler,
     RespCacheable::{self, *},
 };
 use proxy_cache::range_filter::{self};
@@ -137,14 +137,18 @@ pub trait ProxyHttp {
     /// This filter is called after a successful cache lookup and before the
     /// cache asset is ready to be used.
     ///
-    /// This filter allows the user to log or force invalidate the asset.
+    /// This filter allows the user to log or force invalidate the asset, or
+    /// to adjust the body reader associated with the cache hit.
+    /// This also runs on stale hit assets (for which `is_fresh` is false).
     ///
     /// The value returned indicates if the force invalidation should be used,
     /// and which kind. Returning `None` indicates no forced invalidation
     async fn cache_hit_filter(
         &self,
-        _session: &Session,
+        _session: &mut Session,
         _meta: &CacheMeta,
+        _hit_handler: &mut HitHandler,
+        _is_fresh: bool,
         _ctx: &mut Self::CTX,
     ) -> Result<Option<ForcedInvalidationKind>>
     where
@@ -160,6 +164,9 @@ pub trait ProxyHttp {
     ///
     /// This filter can be used for deferring checks like rate limiting or access control to when they
     /// actually needed after cache miss.
+    ///
+    /// By default the session will attempt to be reused after returning Ok(false). It is the
+    /// caller's responsibility to disable keepalive or drain the request body if needed.
     async fn proxy_upstream_filter(
         &self,
         _session: &mut Session,
@@ -225,13 +232,15 @@ pub trait ProxyHttp {
     /// It also allow users to modify the response header accordingly.
     ///
     /// The default implementation can handle a single-range as per [RFC7232].
+    ///
+    /// [RFC7232]: https://www.rfc-editor.org/rfc/rfc7232
     fn range_header_filter(
         &self,
-        req: &RequestHeader,
+        session: &mut Session,
         resp: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> range_filter::RangeType {
-        proxy_cache::range_filter::range_header_filter(req, resp)
+        proxy_cache::range_filter::range_header_filter(session.req_header(), resp)
     }
 
     /// Modify the request before it is sent to the upstream
@@ -262,7 +271,8 @@ pub trait ProxyHttp {
         _session: &mut Session,
         _upstream_response: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
-    ) {
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Modify the response header before it is send to the downstream

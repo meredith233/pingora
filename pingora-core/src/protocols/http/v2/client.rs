@@ -24,6 +24,7 @@ use log::{debug, error, warn};
 use pingora_error::{Error, ErrorType, ErrorType::*, OrErr, Result, RetryType};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
+use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -257,7 +258,9 @@ impl Http2Session {
         // https://docs.rs/h2/latest/h2/struct.RecvStream.html#method.is_end_stream
         // So poll the data once to check this condition. If an error is returned, that indicates
         // that the stream closed due to an error e.g. h2 protocol error.
-        match reader.data().now_or_never() {
+        //
+        // tokio::task::unconstrained because now_or_never may yield None when the future is ready
+        match tokio::task::unconstrained(reader.data()).now_or_never() {
             Some(None) => Ok(true),
             Some(Some(Ok(_))) => Error::e_explain(H2Error, "unexpected data after end stream"),
             Some(Some(Err(e))) => Error::e_because(H2Error, "while checking end stream", e),
@@ -433,7 +436,16 @@ fn handle_read_header_error(e: h2::Error) -> Box<Error> {
     } else if e.is_io() {
         // is_io: typical if a previously reused connection silently drops it
         // only retry if the connection is reused
-        let true_io_error = e.get_io().unwrap().raw_os_error().is_some();
+        // safety: e.get_io() will always succeed if e.is_io() is true
+        let io_err = e.get_io().expect("checked is io");
+
+        // for h2 hyperium raw_os_error() will be None unless this is a new connection
+        // where we handshake() and from_io() is called, check ErrorKind explicitly with true_io_error
+        let true_io_error = io_err.raw_os_error().is_some()
+            || matches!(
+                io_err.kind(),
+                ErrorKind::ConnectionReset | ErrorKind::TimedOut | ErrorKind::BrokenPipe
+            );
         let mut err = Error::because(ReadError, "while reading h2 header", e);
         if true_io_error {
             err.retry = RetryType::ReusedOnly;
