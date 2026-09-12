@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ use bytes::{Bytes, BytesMut};
 
 /// A buffer with size limit. When the total amount of data written to the buffer is below the limit
 /// all the data will be held in the buffer. Otherwise, the buffer will report to be truncated.
-pub(crate) struct FixedBuffer {
+pub struct FixedBuffer {
     buffer: BytesMut,
     capacity: usize,
     truncated: bool,
@@ -33,13 +33,19 @@ impl FixedBuffer {
 
     // TODO: maybe store a Vec of Bytes for zero-copy
     pub fn write_to_buffer(&mut self, data: &Bytes) {
-        if !self.truncated && (self.buffer.len() + data.len() <= self.capacity) {
+        if self.truncated {
+            return;
+        }
+
+        if self.buffer.len() + data.len() <= self.capacity {
             self.buffer.extend_from_slice(data);
         } else {
-            // TODO: clear data because the data held here is useless anyway?
+            // Buffered data is no longer usable for a retry, so release its allocation.
+            self.buffer = BytesMut::new();
             self.truncated = true;
         }
     }
+
     pub fn clear(&mut self) {
         self.truncated = false;
         self.buffer.clear();
@@ -57,5 +63,23 @@ impl FixedBuffer {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn releases_storage_when_truncated() {
+        let mut buffer = FixedBuffer::new(4);
+        buffer.write_to_buffer(&Bytes::from_static(b"1234"));
+        assert!(buffer.buffer.capacity() >= 4);
+
+        buffer.write_to_buffer(&Bytes::from_static(b"5"));
+
+        assert!(buffer.is_truncated());
+        assert_eq!(buffer.buffer.capacity(), 0);
+        assert!(buffer.get_buffer().is_none());
     }
 }

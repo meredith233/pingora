@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,29 +13,35 @@
 // limitations under the License.
 
 use super::*;
-use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use http::{Method, StatusCode};
 use pingora_cache::key::CacheHashKey;
-use pingora_cache::lock::LockStatus;
+use pingora_cache::lock::LockWaitOutcome;
 use pingora_cache::max_file_size::ERR_RESPONSE_TOO_LARGE;
-use pingora_cache::{ForcedInvalidationKind, HitStatus, RespCacheable::*};
+use pingora_cache::{ForcedFreshness, HitHandler, HitStatus, RespCacheable::*};
 use pingora_core::protocols::http::conditional_filter::to_304;
 use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_core::ErrorType;
 use range_filter::RangeBodyFilter;
 use std::time::SystemTime;
 
-impl<SV> HttpProxy<SV> {
+const DEFAULT_MAX_CACHE_LOCK_RETRIES: usize = 2;
+
+impl<SV, C, DS> HttpProxy<SV, C, DS>
+where
+    C: custom::Connector,
+    DS: DownstreamSession,
+{
     // return bool: server_session can be reused, and error if any
     pub(crate) async fn proxy_cache(
         self: &Arc<Self>,
-        session: &mut Session,
-        ctx: &mut SV::CTX,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> Option<(bool, Option<Box<Error>>)>
     // None: continue to proxy, Some: return
     where
-        SV: ProxyHttp + Send + Sync + 'static,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync + 'static,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         // Cache logic request phase
         if let Err(e) = self.inner.request_cache_filter(session, ctx) {
@@ -78,8 +84,8 @@ impl<SV> HttpProxy<SV> {
         }
 
         // cache lookup logic
+        let mut cache_lock_retries = 0;
         loop {
-            // for cache lock, TODO: cap the max number of loops
             match session.cache.cache_lookup().await {
                 Ok(res) => {
                     let mut hit_status_opt = None;
@@ -115,7 +121,8 @@ impl<SV> HttpProxy<SV> {
 
                         // hit
                         // TODO: maybe round and/or cache now()
-                        let is_fresh = meta.is_fresh(SystemTime::now());
+                        let now = SystemTime::now();
+                        let is_fresh = meta.is_fresh(now);
                         // check if we should force expire or force miss
                         let hit_status = match self
                             .inner
@@ -137,13 +144,22 @@ impl<SV> HttpProxy<SV> {
                                     HitStatus::Expired
                                 }
                             }
-                            Ok(Some(ForcedInvalidationKind::ForceExpired)) => {
-                                // force expired asset should not be serve as stale
-                                // because force expire is usually to remove data
+                            Ok(Some(ForcedFreshness::ForceExpired)) => {
+                                // this variant exists to take data out of service, so the
+                                // stale body must not be served while it revalidates
                                 meta.disable_serve_stale();
                                 HitStatus::ForceExpired
                             }
-                            Ok(Some(ForcedInvalidationKind::ForceMiss)) => HitStatus::ForceMiss,
+                            Ok(Some(ForcedFreshness::ForceExpiredServeStale { expired_at })) => {
+                                // this variant keeps the serve stale windows, so they run
+                                // from when the asset went out of service, not its deadline
+                                if let Some(expired_at) = expired_at {
+                                    meta.expire_at(expired_at);
+                                }
+                                HitStatus::ForceExpiredServeStale
+                            }
+                            Ok(Some(ForcedFreshness::ForceMiss)) => HitStatus::ForceMiss,
+                            Ok(Some(ForcedFreshness::ForceFresh)) => HitStatus::ForceFresh,
                         };
 
                         hit_status_opt = Some(hit_status);
@@ -152,12 +168,22 @@ impl<SV> HttpProxy<SV> {
                         session.cache.cache_found(meta, handler, hit_status);
                     }
 
-                    if hit_status_opt.map_or(true, HitStatus::is_treated_as_miss) {
+                    if hit_status_opt.is_none_or(HitStatus::is_treated_as_miss) {
                         // cache miss
-                        if session.cache.is_cache_locked() {
+                        if !session.cache.enabled() {
+                            // An admission policy may have disabled caching during cache_lookup().
+                            break None;
+                        } else if session.cache.is_cache_locked() {
                             // Another request is filling the cache; try waiting til that's done and retry.
-                            let lock_status = session.cache.cache_lock_wait().await;
-                            if self.handle_lock_status(session, ctx, lock_status) {
+                            let outcome = session.cache.cache_lock_wait().await;
+                            if self.handle_lock_wait_outcome(session, ctx, outcome) {
+                                if self.cache_lock_retry_limit_exceeded(
+                                    session,
+                                    ctx,
+                                    &mut cache_lock_retries,
+                                ) {
+                                    break None;
+                                }
                                 continue;
                             } else {
                                 break None;
@@ -190,8 +216,15 @@ impl<SV> HttpProxy<SV> {
                             let will_serve_stale = session.cache.can_serve_stale_updating()
                                 && self.inner.should_serve_stale(session, ctx, None);
                             if !will_serve_stale {
-                                let lock_status = session.cache.cache_lock_wait().await;
-                                if self.handle_lock_status(session, ctx, lock_status) {
+                                let outcome = session.cache.cache_lock_wait().await;
+                                if self.handle_lock_wait_outcome(session, ctx, outcome) {
+                                    if self.cache_lock_retry_limit_exceeded(
+                                        session,
+                                        ctx,
+                                        &mut cache_lock_retries,
+                                    ) {
+                                        break None;
+                                    }
                                     continue;
                                 } else {
                                     break None;
@@ -259,12 +292,12 @@ impl<SV> HttpProxy<SV> {
     // return bool: server_session can be reused, and error if any
     pub(crate) async fn proxy_cache_hit(
         &self,
-        session: &mut Session,
-        ctx: &mut SV::CTX,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> (bool, Option<Box<Error>>)
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         use range_filter::*;
 
@@ -299,6 +332,7 @@ impl<SV> HttpProxy<SV> {
 
         // return a 416 with an empty body for simplicity
         let header_only = header_only || matches!(range_type, RangeType::Invalid);
+        debug!("header: {header:?}");
 
         // TODO: use ProxyUseCache to replace the logic below
         match self.inner.response_filter(session, &mut header, ctx).await {
@@ -351,18 +385,42 @@ impl<SV> HttpProxy<SV> {
         }
         debug!("finished sending cached header to downstream");
 
+        // If the function returns an Err, there was an issue seeking from the hit handler.
+        //
+        // Returning false means that no seeking or state change was done, either because the
+        // hit handler doesn't support the seek or because multipart doesn't apply.
+        fn seek_multipart(
+            hit_handler: &mut HitHandler,
+            range_filter: &mut RangeBodyFilter,
+        ) -> Result<bool> {
+            if !range_filter.is_multipart_range() || !hit_handler.can_seek_multipart() {
+                return Ok(false);
+            }
+            let r = range_filter.next_cache_multipart_range()?;
+            hit_handler.seek_multipart(r.start, Some(r.end))?;
+            // we still need RangeBodyFilter's help to transform the byte
+            // range into a multipart response.
+            range_filter.set_current_cursor(r.start);
+            Ok(true)
+        }
+
         if !header_only {
             let mut maybe_range_filter = match &range_type {
                 RangeType::Single(r) => {
-                    if let Err(e) = session.cache.hit_handler().seek(r.start, Some(r.end)) {
-                        return (false, Some(e));
+                    if session.cache.hit_handler().can_seek() {
+                        if let Err(e) = session.cache.hit_handler().seek(r.start, Some(r.end)) {
+                            return (false, Some(e));
+                        }
+                        None
+                    } else {
+                        Some(RangeBodyFilter::new_range(range_type.clone()))
                     }
-                    None
                 }
                 RangeType::Multi(_) => {
-                    // TODO: seek hit handler for multipart
-                    let mut range_filter = RangeBodyFilter::new();
-                    range_filter.set(range_type.clone());
+                    let mut range_filter = RangeBodyFilter::new_range(range_type.clone());
+                    if let Err(e) = seek_multipart(session.cache.hit_handler(), &mut range_filter) {
+                        return (false, Some(e));
+                    }
                     Some(range_filter)
                 }
                 RangeType::Invalid => unreachable!(),
@@ -373,6 +431,37 @@ impl<SV> HttpProxy<SV> {
                     Ok(raw_body) => {
                         let end = raw_body.is_none();
 
+                        if end {
+                            if let Some(range_filter) = maybe_range_filter.as_mut() {
+                                if range_filter.should_cache_seek_again() {
+                                    let e = match seek_multipart(
+                                        session.cache.hit_handler(),
+                                        range_filter,
+                                    ) {
+                                        Ok(true) => {
+                                            // called seek(), read again
+                                            continue;
+                                        }
+                                        Ok(false) => {
+                                            // body reader can no longer seek multipart,
+                                            // but cache wants to continue seeking
+                                            // the body will just end in this case if we pass the
+                                            // None through
+                                            // (TODO: how might hit handlers want to recover from
+                                            // this situation)?
+                                            Error::explain(
+                                                InternalError,
+                                                "hit handler cannot seek for multipart again",
+                                            )
+                                            // the body will just end in this case.
+                                        }
+                                        Err(e) => e,
+                                    };
+                                    return (false, Some(e));
+                                }
+                            }
+                        }
+
                         let mut body = if let Some(range_filter) = maybe_range_filter.as_mut() {
                             range_filter.filter_body(raw_body)
                         } else {
@@ -382,6 +471,7 @@ impl<SV> HttpProxy<SV> {
                         match self
                             .inner
                             .response_body_filter(session, &mut body, end, ctx)
+                            .await
                         {
                             Ok(Some(duration)) => {
                                 trace!("delaying response for {duration:?}");
@@ -402,7 +492,7 @@ impl<SV> HttpProxy<SV> {
                             return (false, Some(e));
                         }
 
-                        if !end && body.as_ref().map_or(true, |b| b.is_empty()) {
+                        if !end && body.as_ref().is_none_or(|b| b.is_empty()) {
                             // Don't write empty body which will end session,
                             // still more hit handler bytes to read
                             continue;
@@ -427,6 +517,7 @@ impl<SV> HttpProxy<SV> {
             }
         }
 
+        // No enabled() guard: no concurrent upstream can disable cache here.
         if let Err(e) = session.cache.finish_hit_handler().await {
             warn!("Error during finish_hit_handler: {}", e);
         }
@@ -445,11 +536,11 @@ impl<SV> HttpProxy<SV> {
     pub(crate) fn downstream_response_conditional_filter(
         &self,
         use_cache: &mut ServeFromCache,
-        session: &Session,
+        session: &Session<DS>,
         resp: &mut ResponseHeader,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) where
-        SV: ProxyHttp,
+        SV: ProxyHttp<DS>,
     {
         // TODO: range
         let req = session.req_header();
@@ -480,16 +571,32 @@ impl<SV> HttpProxy<SV> {
 
     // TODO: cache upstream header filter to add/remove headers
 
+    async fn finish_miss_handler_best_effort(
+        &self,
+        session: &mut Session<DS>,
+        ctx: &<SV as ProxyHttp<DS>>::CTX,
+    ) where
+        SV: ProxyHttp<DS>,
+    {
+        if let Err(e) = session.cache.finish_miss_handler().await {
+            warn!(
+                "Failed to finish cache miss admission: {e}, {}",
+                self.inner.request_summary(session, ctx)
+            );
+            session.cache.disable(NoCacheReason::StorageError);
+        }
+    }
+
     pub(crate) async fn cache_http_task(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         task: &HttpTask,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         serve_from_cache: &mut ServeFromCache,
     ) -> Result<()>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         if !session.cache.enabled() && !session.cache.bypassing() {
             return Ok(());
@@ -509,13 +616,20 @@ impl<SV> HttpProxy<SV> {
                     Cacheable(meta) => {
                         let mut fill_cache = true;
                         if session.cache.bypassing() {
-                            // The cache might have been bypassed because the response exceeded the
-                            // maximum cacheable asset size. If that looks like the case (there
-                            // is a maximum file size configured and we don't know the content
-                            // length up front), attempting to re-enable the cache now would cause
-                            // the request to fail when the chunked response exceeds the maximum
-                            // file size again.
-                            if session.cache.max_file_size_bytes().is_some()
+                            // Only hold this request back if the predictor bypassed it over size.
+                            // Re-enabling the cache without a known content length would fail the
+                            // request mid-body if the response exceeds the maximum file size
+                            // again, so wait for the body to finish and let the response filters
+                            // re-admit the key. Every other bypass reason says nothing about size
+                            // and must not be reported as PredictedResponseTooLarge.
+                            let bypassed_over_size =
+                                match session.cache.predicted_uncacheable_reason() {
+                                    Some(reason) => reason == NoCacheReason::ResponseTooLarge,
+                                    // unknown reason, stay conservative
+                                    None => true,
+                                };
+                            if bypassed_over_size
+                                && session.cache.max_file_size_bytes().is_some()
                                 && !meta.headers().contains_key(header::CONTENT_LENGTH)
                             {
                                 session
@@ -530,6 +644,9 @@ impl<SV> HttpProxy<SV> {
                                 && meta.response_header().status == StatusCode::OK
                             {
                                 self.inner.cache_miss(session, ctx);
+                                if !session.cache.enabled() {
+                                    fill_cache = false;
+                                }
                             } else {
                                 // we've allowed caching on the next request,
                                 // but do not cache _this_ request if bypassed and not 200
@@ -585,7 +702,7 @@ impl<SV> HttpProxy<SV> {
                                     .unwrap() // safe, it is set above
                                     .write_body(Bytes::new(), true)
                                     .await?;
-                                session.cache.finish_miss_handler().await?;
+                                self.finish_miss_handler_best_effort(session, ctx).await;
                             }
                         }
                     }
@@ -598,49 +715,54 @@ impl<SV> HttpProxy<SV> {
                     }
                 }
             }
-            HttpTask::Body(data, end_stream) => match data {
-                Some(d) => {
-                    if session.cache.enabled() {
-                        // TODO: do this async
-                        // fail if writing the body would exceed the max_file_size_bytes
-                        let body_size_allowed =
-                            session.cache.track_body_bytes_for_max_file_size(d.len());
-                        if !body_size_allowed {
-                            debug!("chunked response exceeded max cache size, remembering that it is uncacheable");
-                            session
-                                .cache
-                                .response_became_uncacheable(NoCacheReason::ResponseTooLarge);
+            HttpTask::Body(data, end_stream) | HttpTask::UpgradedBody(data, end_stream) => {
+                // It is not normally advisable to cache upgraded responses
+                // e.g. they are essentially close-delimited, so they are easily truncated
+                // but the framework still allows for it
+                match data {
+                    Some(d) => {
+                        if session.cache.enabled() {
+                            // TODO: do this async
+                            // fail if writing the body would exceed the max_file_size_bytes
+                            let body_size_allowed =
+                                session.cache.track_body_bytes_for_max_file_size(d.len());
+                            if !body_size_allowed {
+                                debug!("chunked response exceeded max cache size, remembering that it is uncacheable");
+                                session
+                                    .cache
+                                    .response_became_uncacheable(NoCacheReason::ResponseTooLarge);
 
-                            return Error::e_explain(
-                                ERR_RESPONSE_TOO_LARGE,
-                                format!(
-                                    "writing data of size {} bytes would exceed max file size of {} bytes",
-                                    d.len(),
-                                    session.cache.max_file_size_bytes().expect("max file size bytes must be set to exceed size")
-                                ),
-                            );
+                                return Error::e_explain(
+                                    ERR_RESPONSE_TOO_LARGE,
+                                    format!(
+                                        "writing data of size {} bytes would exceed max file size of {} bytes",
+                                        d.len(),
+                                        session.cache.max_file_size_bytes().expect("max file size bytes must be set to exceed size")
+                                    ),
+                                );
+                            }
+
+                            // this will panic if more data is sent after we see end_stream
+                            // but should be impossible in real world
+                            let miss_handler = session.cache.miss_handler().unwrap();
+
+                            miss_handler.write_body(d.clone(), *end_stream).await?;
+                            if *end_stream {
+                                self.finish_miss_handler_best_effort(session, ctx).await;
+                            }
                         }
-
-                        // this will panic if more data is sent after we see end_stream
-                        // but should be impossible in real world
-                        let miss_handler = session.cache.miss_handler().unwrap();
-
-                        miss_handler.write_body(d.clone(), *end_stream).await?;
-                        if *end_stream {
-                            session.cache.finish_miss_handler().await?;
+                    }
+                    None => {
+                        if session.cache.enabled() && *end_stream {
+                            self.finish_miss_handler_best_effort(session, ctx).await;
                         }
                     }
                 }
-                None => {
-                    if session.cache.enabled() && *end_stream {
-                        session.cache.finish_miss_handler().await?;
-                    }
-                }
-            },
+            }
             HttpTask::Trailer(_) => {} // h1 trailer is not supported yet
             HttpTask::Done => {
                 if session.cache.enabled() {
-                    session.cache.finish_miss_handler().await?;
+                    self.finish_miss_handler_best_effort(session, ctx).await;
                 }
             }
             HttpTask::Failed(_) => {
@@ -656,13 +778,13 @@ impl<SV> HttpProxy<SV> {
     // Return true if local cache should be used, false otherwise
     pub(crate) async fn revalidate_or_stale(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         task: &mut HttpTask,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> bool
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         if !session.cache.enabled() {
             return false;
@@ -724,7 +846,7 @@ impl<SV> HttpProxy<SV> {
                                 // (downstream may have a different cacheability assessment and could cache the 304)
 
                                 //TODO: log more
-                                warn!("Uncacheable {reason:?} 304 received");
+                                debug!("Uncacheable {reason:?} 304 received");
                                 session.cache.response_became_uncacheable(reason);
                                 session.cache.revalidate_uncacheable(merged_header, reason);
                             }
@@ -791,13 +913,13 @@ impl<SV> HttpProxy<SV> {
     // bool: can the downstream connection be reused
     pub(crate) async fn handle_stale_if_error(
         &self,
-        session: &mut Session,
-        ctx: &mut SV::CTX,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         error: &Error,
     ) -> Option<(bool, Option<Box<Error>>)>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         // the caller might already checked this as an optimization
         if !session.cache.can_serve_stale_error() {
@@ -831,30 +953,34 @@ impl<SV> HttpProxy<SV> {
     }
 
     // helper function to check when to continue to retry lock (true) or give up (false)
-    fn handle_lock_status(
+    fn handle_lock_wait_outcome(
         &self,
-        session: &mut Session,
-        ctx: &SV::CTX,
-        lock_status: LockStatus,
+        session: &mut Session<DS>,
+        ctx: &<SV as ProxyHttp<DS>>::CTX,
+        outcome: LockWaitOutcome,
     ) -> bool
     where
-        SV: ProxyHttp,
+        SV: ProxyHttp<DS>,
     {
-        debug!("cache unlocked {lock_status:?}");
-        match lock_status {
+        debug!("cache unlocked {outcome:?}");
+        match outcome {
             // should lookup the cached asset again
-            LockStatus::Done => true,
+            LockWaitOutcome::Done => true,
             // should compete to be a new writer
-            LockStatus::TransientError => true,
-            // the request is uncacheable, go ahead to fetch from the origin
-            LockStatus::GiveUp => {
-                // TODO: It will be nice for the writer to propagate the real reason
+            LockWaitOutcome::TransientError => true,
+            // the writer found no lock was needed; every reader goes upstream
+            LockWaitOutcome::GiveUp => {
                 session.cache.disable(NoCacheReason::CacheLockGiveUp);
-                // not cacheable, just go to the origin.
+                false
+            }
+            // this reader alone stopped waiting, over a fill it cannot use; the
+            // cause travels with the outcome, so there is nothing to look up
+            LockWaitOutcome::Abandoned { reason, .. } => {
+                session.cache.disable(reason);
                 false
             }
             // treat this the same as TransientError
-            LockStatus::Dangling => {
+            LockWaitOutcome::Dangling => {
                 // software bug, but request can recover from this
                 warn!(
                     "Dangling cache lock, {}",
@@ -862,14 +988,9 @@ impl<SV> HttpProxy<SV> {
                 );
                 true
             }
-            /* We have 3 options when a lock is held too long
-             * 1. release the lock and let every request complete for it again
-             * 2. let every request cache miss
-             * 3. let every request through while disabling cache
-             * #1 could repeat the situation but protect the origin from load
-             * #2 could amplify disk writes and storage for temp file
-             * #3 is the simplest option for now */
-            LockStatus::Timeout => {
+            // If this reader has spent too long waiting on locks, let the request
+            // through while disabling cache (to avoid amplifying disk writes).
+            LockWaitOutcome::WaitTimeout => {
                 warn!(
                     "Cache lock timeout, {}",
                     self.inner.request_summary(session, ctx)
@@ -878,9 +999,37 @@ impl<SV> HttpProxy<SV> {
                 // not cacheable, just go to the origin.
                 false
             }
-            // software bug, this status should be impossible to reach
-            LockStatus::Waiting => panic!("impossible LockStatus::Waiting"),
+            // When a singular cache lock has been held for too long,
+            // we should allow requests to recompete for the lock
+            // to protect upstreams from load.
+            LockWaitOutcome::AgeTimeout => true,
         }
+    }
+
+    fn cache_lock_retry_limit_exceeded(
+        &self,
+        session: &mut Session<DS>,
+        ctx: &<SV as ProxyHttp<DS>>::CTX,
+        cache_lock_retries: &mut usize,
+    ) -> bool
+    where
+        SV: ProxyHttp<DS>,
+    {
+        *cache_lock_retries += 1;
+        let max_retries = session
+            .cache
+            .cache_lock_max_retries()
+            .unwrap_or(DEFAULT_MAX_CACHE_LOCK_RETRIES);
+        if *cache_lock_retries <= max_retries {
+            return false;
+        }
+
+        warn!(
+            "Cache lock retry limit exceeded, {}",
+            self.inner.request_summary(session, ctx)
+        );
+        session.cache.disable(NoCacheReason::CacheLockRetryLimit);
+        true
     }
 }
 
@@ -898,6 +1047,12 @@ fn cache_hit_header(cache: &HttpCache) -> Box<ResponseHeader> {
         let age = cache.cache_meta().age().as_secs();
         header.insert_header(http::header::AGE, age).unwrap();
     }
+    log::debug!("cache header: {header:?} {:?}", cache.phase());
+
+    // currently storage cache is always considered an h1 upstream
+    // (header-serde serializes as h1.0 or h1.1)
+    // set this header to be h1.1
+    header.set_version(Version::HTTP_11);
 
     /* Add chunked header to tell downstream to use chunked encoding
      * during the absent of content-length in h2 */
@@ -924,7 +1079,11 @@ pub mod range_filter {
         str::from_utf8(input).ok()?.parse().ok()
     }
 
-    fn parse_range_header(range: &[u8], content_length: usize) -> RangeType {
+    fn parse_range_header(
+        range: &[u8],
+        content_length: usize,
+        max_multipart_ranges: Option<usize>,
+    ) -> RangeType {
         use regex::Regex;
 
         // Match individual range parts, (e.g. "0-100", "-5", "1-")
@@ -951,15 +1110,21 @@ pub mod range_filter {
             return RangeType::None;
         };
 
+        // "bytes=" with an empty (or whitespace-only) range-set is syntactically a
+        // range request with zero satisfiable range-specs, so return 416.
+        if ranges_str.trim().is_empty() {
+            return RangeType::Invalid;
+        }
+
         // Get the actual range string (e.g."100-200,300-400")
         let mut range_count = 0;
         for _ in ranges_str.split(',') {
             range_count += 1;
-            // TODO: make configurable
-            const MAX_RANGES: usize = 100;
-            if range_count >= MAX_RANGES {
-                // If we get more than MAX_RANGES ranges, return None for now to save parsing time
-                return RangeType::None;
+            if let Some(max_ranges) = max_multipart_ranges {
+                if range_count >= max_ranges {
+                    // If we get more than max configured ranges, return None for now to save parsing time
+                    return RangeType::None;
+                }
             }
         }
         let mut ranges: Vec<Range<usize>> = Vec::with_capacity(range_count);
@@ -1040,40 +1205,50 @@ pub mod range_filter {
     #[test]
     fn test_parse_range() {
         assert_eq!(
-            parse_range_header(b"bytes=0-1", 10),
+            parse_range_header(b"bytes=0-1", 10, None),
             RangeType::new_single(0, 2)
         );
         assert_eq!(
-            parse_range_header(b"bYTes=0-9", 10),
+            parse_range_header(b"bYTes=0-9", 10, None),
             RangeType::new_single(0, 10)
         );
         assert_eq!(
-            parse_range_header(b"bytes=0-12", 10),
+            parse_range_header(b"bytes=0-12", 10, None),
             RangeType::new_single(0, 10)
         );
         assert_eq!(
-            parse_range_header(b"bytes=0-", 10),
+            parse_range_header(b"bytes=0-", 10, None),
             RangeType::new_single(0, 10)
         );
-        assert_eq!(parse_range_header(b"bytes=2-1", 10), RangeType::Invalid);
-        assert_eq!(parse_range_header(b"bytes=10-11", 10), RangeType::Invalid);
         assert_eq!(
-            parse_range_header(b"bytes=-2", 10),
+            parse_range_header(b"bytes=2-1", 10, None),
+            RangeType::Invalid
+        );
+        assert_eq!(
+            parse_range_header(b"bytes=10-11", 10, None),
+            RangeType::Invalid
+        );
+        assert_eq!(
+            parse_range_header(b"bytes=-2", 10, None),
             RangeType::new_single(8, 10)
         );
         assert_eq!(
-            parse_range_header(b"bytes=-12", 10),
+            parse_range_header(b"bytes=-12", 10, None),
             RangeType::new_single(0, 10)
         );
-        assert_eq!(parse_range_header(b"bytes=-", 10), RangeType::Invalid);
-        assert_eq!(parse_range_header(b"bytes=", 10), RangeType::None);
+        assert_eq!(parse_range_header(b"bytes=-", 10, None), RangeType::Invalid);
+        assert_eq!(parse_range_header(b"bytes=", 10, None), RangeType::Invalid);
+        assert_eq!(
+            parse_range_header(b"bytes=  ", 10, None),
+            RangeType::Invalid
+        );
     }
 
     // Add some tests for multi-range too
     #[test]
     fn test_parse_range_header_multi() {
         assert_eq!(
-            parse_range_header(b"bytes=0-1,4-5", 10)
+            parse_range_header(b"bytes=0-1,4-5", 10, None)
                 .get_multirange_info()
                 .expect("Should have multipart info for Multipart range request")
                 .ranges,
@@ -1081,7 +1256,7 @@ pub mod range_filter {
         );
         // Last range is invalid because the content-length is too small
         assert_eq!(
-            parse_range_header(b"bytEs=0-99,200-299,400-499", 320)
+            parse_range_header(b"bytEs=0-99,200-299,400-499", 320, None)
                 .get_multirange_info()
                 .expect("Should have multipart info for Multipart range request")
                 .ranges,
@@ -1095,7 +1270,7 @@ pub mod range_filter {
         );
         // Same as above but appropriate content length
         assert_eq!(
-            parse_range_header(b"bytEs=0-99,200-299,400-499", 500)
+            parse_range_header(b"bytEs=0-99,200-299,400-499", 500, None)
                 .get_multirange_info()
                 .expect("Should have multipart info for Multipart range request")
                 .ranges,
@@ -1112,29 +1287,35 @@ pub mod range_filter {
             ]
         );
         // Looks like a range request but it is continuous, we decline to range
-        assert_eq!(parse_range_header(b"bytes=0-,-2", 10), RangeType::None,);
+        assert_eq!(
+            parse_range_header(b"bytes=0-,-2", 10, None),
+            RangeType::None,
+        );
         // Should not have multirange info set
-        assert!(parse_range_header(b"bytes=0-,-2", 10)
+        assert!(parse_range_header(b"bytes=0-,-2", 10, None)
             .get_multirange_info()
             .is_none());
         // Overlapping ranges, these ranges are currently declined
-        assert_eq!(parse_range_header(b"bytes=0-3,2-5", 10), RangeType::None,);
-        assert!(parse_range_header(b"bytes=0-3,2-5", 10)
+        assert_eq!(
+            parse_range_header(b"bytes=0-3,2-5", 10, None),
+            RangeType::None,
+        );
+        assert!(parse_range_header(b"bytes=0-3,2-5", 10, None)
             .get_multirange_info()
             .is_none());
 
         // Content length is 2, so only range is 0-2.
         assert_eq!(
-            parse_range_header(b"bytes=0-5,10-", 2),
+            parse_range_header(b"bytes=0-5,10-", 2, None),
             RangeType::new_single(0, 2)
         );
-        assert!(parse_range_header(b"bytes=0-5,10-", 2)
+        assert!(parse_range_header(b"bytes=0-5,10-", 2, None)
             .get_multirange_info()
             .is_none());
 
         // We should ignore the last incorrect range and return the other acceptable ranges
         assert_eq!(
-            parse_range_header(b"bytes=0-5, 10-20, 30-18", 200)
+            parse_range_header(b"bytes=0-5, 10-20, 30-18", 200, None)
                 .get_multirange_info()
                 .expect("Should have multipart info for Multipart range request")
                 .ranges,
@@ -1142,7 +1323,7 @@ pub mod range_filter {
         );
         // All invalid ranges
         assert_eq!(
-            parse_range_header(b"bytes=5-0, 20-15, 30-25", 200),
+            parse_range_header(b"bytes=5-0, 20-15, 30-25", 200, None),
             RangeType::Invalid
         );
 
@@ -1162,9 +1343,12 @@ pub mod range_filter {
             s.into_bytes()
         }
 
-        // Test 100 range limit for parsing.
-        let ranges = generate_range_header(101);
-        assert_eq!(parse_range_header(&ranges, 1000), RangeType::None)
+        // Test 200 range limit for parsing.
+        let ranges = generate_range_header(201);
+        assert_eq!(
+            parse_range_header(&ranges, 1000, Some(200)),
+            RangeType::None
+        )
     }
 
     // For Multipart Requests, we need to know the boundary, content length and type across
@@ -1174,7 +1358,7 @@ pub mod range_filter {
         pub ranges: Vec<Range<usize>>,
         pub boundary: String,
         total_length: usize,
-        content_type: Option<String>,
+        pub content_type: Option<String>,
     }
 
     impl MultiRangeInfo {
@@ -1203,7 +1387,7 @@ pub mod range_filter {
             let mut rng: rand::prelude::ThreadRng = rand::thread_rng();
             format!("{:016x}", rng.gen::<u64>())
         }
-        fn calculate_multipart_length(&self) -> usize {
+        pub fn calculate_multipart_length(&self) -> usize {
             let mut total_length = 0;
             let content_type = self.content_type.as_ref();
             for range in self.ranges.clone() {
@@ -1266,22 +1450,17 @@ pub mod range_filter {
     }
 
     // Handles both single-range and multipart-range requests
-    pub fn range_header_filter(req: &RequestHeader, resp: &mut ResponseHeader) -> RangeType {
+    pub fn range_header_filter(
+        req: &RequestHeader,
+        resp: &mut ResponseHeader,
+        max_multipart_ranges: Option<usize>,
+    ) -> RangeType {
         // The Range header field is evaluated after evaluating the precondition
         // header fields defined in [RFC7232], and only if the result in absence
         // of the Range header field would be a 200 (OK) response
         if resp.status != StatusCode::OK {
             return RangeType::None;
         }
-
-        // "A server MUST ignore a Range header field received with a request method other than GET."
-        if req.method != http::Method::GET && req.method != http::Method::HEAD {
-            return RangeType::None;
-        }
-
-        let Some(range_header) = req.headers.get(RANGE) else {
-            return RangeType::None;
-        };
 
         // Content-Length is not required by RFC but it is what nginx does and easier to implement
         // with this header present.
@@ -1293,37 +1472,65 @@ pub mod range_filter {
             return RangeType::None;
         };
 
-        // if-range wants to understand if the Last-Modified / ETag value matches exactly for use
-        // with resumable downloads.
-        // https://datatracker.ietf.org/doc/html/rfc9110#name-if-range
-        // Note that the RFC wants strong validation, and suggests that
-        // "A valid entity-tag can be distinguished from a valid HTTP-date
-        // by examining the first three characters for a DQUOTE,"
-        // but this current etag matching behavior most closely mirrors nginx.
-        if let Some(if_range) = req.headers.get(IF_RANGE) {
-            let ir = if_range.as_bytes();
-            let matches = if ir.len() >= 2 && ir.last() == Some(&b'"') {
-                resp.headers.get(ETAG).is_some_and(|etag| etag == if_range)
-            } else if let Some(last_modified) = resp.headers.get(LAST_MODIFIED) {
-                last_modified == if_range
-            } else {
-                false
-            };
-            if !matches {
-                return RangeType::None;
-            }
-        }
-
+        // At this point the response is allowed to be served as ranges
         // TODO: we can also check Accept-Range header from resp. Nginx gives uses the option
         // see proxy_force_ranges
 
-        let mut range_type = parse_range_header(range_header.as_bytes(), content_length);
+        fn request_range_type(
+            req: &RequestHeader,
+            resp: &ResponseHeader,
+            content_length: usize,
+            max_multipart_ranges: Option<usize>,
+        ) -> RangeType {
+            // "A server MUST ignore a Range header field received with a request method other than GET."
+            if req.method != http::Method::GET && req.method != http::Method::HEAD {
+                return RangeType::None;
+            }
+
+            let Some(range_header) = req.headers.get(RANGE) else {
+                return RangeType::None;
+            };
+
+            // if-range wants to understand if the Last-Modified / ETag value matches exactly for use
+            // with resumable downloads.
+            // https://datatracker.ietf.org/doc/html/rfc9110#name-if-range
+            // Note that the RFC wants strong validation, and suggests that
+            // "A valid entity-tag can be distinguished from a valid HTTP-date
+            // by examining the first three characters for a DQUOTE,"
+            // but this current etag matching behavior most closely mirrors nginx.
+            if let Some(if_range) = req.headers.get(IF_RANGE) {
+                let ir = if_range.as_bytes();
+                let matches = if ir.len() >= 2 && ir.last() == Some(&b'"') {
+                    resp.headers.get(ETAG).is_some_and(|etag| etag == if_range)
+                } else if let Some(last_modified) = resp.headers.get(LAST_MODIFIED) {
+                    last_modified == if_range
+                } else {
+                    false
+                };
+                if !matches {
+                    return RangeType::None;
+                }
+            }
+
+            parse_range_header(
+                range_header.as_bytes(),
+                content_length,
+                max_multipart_ranges,
+            )
+        }
+
+        let mut range_type = request_range_type(req, resp, content_length, max_multipart_ranges);
 
         match &mut range_type {
-            RangeType::None => { /* nothing to do*/ }
+            RangeType::None => {
+                // At this point, the response is _eligible_ to be served in ranges
+                // in the future, so add Accept-Ranges, mirroring nginx behavior
+                resp.insert_header(&ACCEPT_RANGES, "bytes").unwrap();
+            }
             RangeType::Single(r) => {
                 // 206 response
                 resp.set_status(StatusCode::PARTIAL_CONTENT).unwrap();
+                resp.remove_header(&ACCEPT_RANGES);
                 resp.insert_header(&CONTENT_LENGTH, r.end - r.start)
                     .unwrap();
                 resp.insert_header(
@@ -1346,6 +1553,7 @@ pub mod range_filter {
                 let total_length = multi_range_info.calculate_multipart_length();
 
                 resp.set_status(StatusCode::PARTIAL_CONTENT).unwrap();
+                resp.remove_header(&ACCEPT_RANGES);
                 resp.insert_header(CONTENT_LENGTH, total_length).unwrap();
                 resp.insert_header(
                     CONTENT_TYPE,
@@ -1363,8 +1571,10 @@ pub mod range_filter {
                 // empty body for simplicity
                 resp.insert_header(&CONTENT_LENGTH, HeaderValue::from_static("0"))
                     .unwrap();
-                // TODO: remove other headers like content-encoding
+                resp.remove_header(&ACCEPT_RANGES);
                 resp.remove_header(&CONTENT_TYPE);
+                resp.remove_header(&CONTENT_ENCODING);
+                resp.remove_header(&TRANSFER_ENCODING);
                 resp.insert_header(&CONTENT_RANGE, format!("bytes */{content_length}"))
                     .unwrap()
             }
@@ -1387,8 +1597,23 @@ pub mod range_filter {
         // no range
         let req = gen_req();
         let mut resp = gen_resp();
-        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp));
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
         assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
+
+        // no range, try HEAD
+        let mut req = gen_req();
+        req.set_method(Method::HEAD);
+        let mut resp = gen_resp();
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
+        assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
 
         // regular range
         let mut req = gen_req();
@@ -1396,7 +1621,7 @@ pub mod range_filter {
         let mut resp = gen_resp();
         assert_eq!(
             RangeType::new_single(0, 2),
-            range_header_filter(&req, &mut resp)
+            range_header_filter(&req, &mut resp, None)
         );
         assert_eq!(resp.status.as_u16(), 206);
         assert_eq!(resp.headers.get("content-length").unwrap().as_bytes(), b"2");
@@ -1404,18 +1629,46 @@ pub mod range_filter {
             resp.headers.get("content-range").unwrap().as_bytes(),
             b"bytes 0-1/10"
         );
+        assert!(resp.headers.get("accept-ranges").is_none());
+
+        // regular range, accept-ranges included
+        let mut req = gen_req();
+        req.insert_header("Range", "bytes=0-1").unwrap();
+        let mut resp = gen_resp();
+        resp.insert_header("Accept-Ranges", "bytes").unwrap();
+        assert_eq!(
+            RangeType::new_single(0, 2),
+            range_header_filter(&req, &mut resp, None)
+        );
+        assert_eq!(resp.status.as_u16(), 206);
+        assert_eq!(resp.headers.get("content-length").unwrap().as_bytes(), b"2");
+        assert_eq!(
+            resp.headers.get("content-range").unwrap().as_bytes(),
+            b"bytes 0-1/10"
+        );
+        // accept-ranges stripped
+        assert!(resp.headers.get("accept-ranges").is_none());
 
         // bad range
         let mut req = gen_req();
         req.insert_header("Range", "bytes=1-0").unwrap();
         let mut resp = gen_resp();
-        assert_eq!(RangeType::Invalid, range_header_filter(&req, &mut resp));
+        resp.insert_header("Accept-Ranges", "bytes").unwrap();
+        resp.insert_header("Content-Encoding", "gzip").unwrap();
+        resp.insert_header("Transfer-Encoding", "chunked").unwrap();
+        assert_eq!(
+            RangeType::Invalid,
+            range_header_filter(&req, &mut resp, None)
+        );
         assert_eq!(resp.status.as_u16(), 416);
         assert_eq!(resp.headers.get("content-length").unwrap().as_bytes(), b"0");
         assert_eq!(
             resp.headers.get("content-range").unwrap().as_bytes(),
             b"bytes */10"
         );
+        assert!(resp.headers.get("accept-ranges").is_none());
+        assert!(resp.headers.get("content-encoding").is_none());
+        assert!(resp.headers.get("transfer-encoding").is_none());
     }
 
     // Multipart Tests
@@ -1442,7 +1695,7 @@ pub mod range_filter {
         // valid multipart range
         let req = gen_req();
         let mut resp = gen_resp();
-        let result = range_header_filter(&req, &mut resp);
+        let result = range_header_filter(&req, &mut resp, None);
         let mut boundary_str = String::new();
 
         assert!(matches!(result, RangeType::Multi(_)));
@@ -1464,24 +1717,34 @@ pub mod range_filter {
             format!("multipart/byteranges; boundary={boundary_str}")
         );
         assert!(resp.headers.get("content_length").is_none());
+        assert!(resp.headers.get("accept-ranges").is_none());
 
         // overlapping range, multipart range is declined
         let req = gen_req_overlap_range();
         let mut resp = gen_resp();
-        let result = range_header_filter(&req, &mut resp);
+        let result = range_header_filter(&req, &mut resp, None);
 
         assert!(matches!(result, RangeType::None));
         assert_eq!(resp.status.as_u16(), 200);
         assert!(resp.headers.get("content-type").is_none());
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
 
         // bad multipart range
         let mut req = gen_req();
         req.insert_header("Range", "bytes=1-0, 12-9, 50-40")
             .unwrap();
         let mut resp = gen_resp();
-        let result = range_header_filter(&req, &mut resp);
+        resp.insert_header("Content-Encoding", "br").unwrap();
+        resp.insert_header("Transfer-Encoding", "chunked").unwrap();
+        let result = range_header_filter(&req, &mut resp, None);
         assert!(matches!(result, RangeType::Invalid));
         assert_eq!(resp.status.as_u16(), 416);
+        assert!(resp.headers.get("accept-ranges").is_none());
+        assert!(resp.headers.get("content-encoding").is_none());
+        assert!(resp.headers.get("transfer-encoding").is_none());
     }
 
     #[test]
@@ -1513,7 +1776,7 @@ pub mod range_filter {
         let mut resp = gen_resp();
         assert_eq!(
             RangeType::new_single(0, 2),
-            range_header_filter(&req, &mut resp)
+            range_header_filter(&req, &mut resp, None)
         );
 
         // non-matching date
@@ -1521,7 +1784,12 @@ pub mod range_filter {
         req.insert_header("If-Range", "Fri, 07 Jul 2023 22:03:25 GMT")
             .unwrap();
         let mut resp = gen_resp();
-        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp));
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
+        assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
 
         // match ETag
         let mut req = gen_req();
@@ -1529,33 +1797,46 @@ pub mod range_filter {
         let mut resp = gen_resp();
         assert_eq!(
             RangeType::new_single(0, 2),
-            range_header_filter(&req, &mut resp)
+            range_header_filter(&req, &mut resp, None)
         );
+        assert_eq!(resp.status.as_u16(), 206);
+        assert!(resp.headers.get("accept-ranges").is_none());
 
         // non-matching ETags do not result in range
         let mut req = gen_req();
         req.insert_header("If-Range", "\"4567\"").unwrap();
         let mut resp = gen_resp();
-        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp));
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
+        assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
 
         let mut req = gen_req();
         req.insert_header("If-Range", "1234").unwrap();
         let mut resp = gen_resp();
-        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp));
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
+        assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
 
         // multipart range with If-Range
         let mut req = get_multipart_req();
         req.insert_header("If-Range", DATE).unwrap();
         let mut resp = gen_resp();
-        let result = range_header_filter(&req, &mut resp);
+        let result = range_header_filter(&req, &mut resp, None);
         assert!(matches!(result, RangeType::Multi(_)));
         assert_eq!(resp.status.as_u16(), 206);
+        assert!(resp.headers.get("accept-ranges").is_none());
 
         // multipart with matching ETag
         let req = get_multipart_req();
         let mut resp = gen_resp();
         assert!(matches!(
-            range_header_filter(&req, &mut resp),
+            range_header_filter(&req, &mut resp, None),
             RangeType::Multi(_)
         ));
 
@@ -1563,14 +1844,19 @@ pub mod range_filter {
         let mut req = get_multipart_req();
         req.insert_header("If-Range", "\"wrong\"").unwrap();
         let mut resp = gen_resp();
-        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp));
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
         assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
     }
 
     pub struct RangeBodyFilter {
         pub range: RangeType,
         current: usize,
         multipart_idx: Option<usize>,
+        cache_multipart_idx: Option<usize>,
     }
 
     impl Default for RangeBodyFilter {
@@ -1585,14 +1871,80 @@ pub mod range_filter {
                 range: RangeType::None,
                 current: 0,
                 multipart_idx: None,
+                cache_multipart_idx: None,
             }
         }
 
-        pub fn set(&mut self, range: RangeType) {
-            self.range = range.clone();
-            if let RangeType::Multi(_) = self.range {
-                self.multipart_idx = Some(0);
+        pub fn new_range(range: RangeType) -> Self {
+            RangeBodyFilter {
+                multipart_idx: matches!(range, RangeType::Multi(_)).then_some(0),
+                range,
+                ..Default::default()
             }
+        }
+
+        pub fn is_multipart_range(&self) -> bool {
+            matches!(self.range, RangeType::Multi(_))
+        }
+
+        /// Whether we should expect the cache body reader to seek again
+        /// for a different range.
+        pub fn should_cache_seek_again(&self) -> bool {
+            match &self.range {
+                RangeType::Multi(multipart_info) => self
+                    .cache_multipart_idx
+                    .is_some_and(|idx| idx != multipart_info.ranges.len() - 1),
+                _ => false,
+            }
+        }
+
+        /// Returns the next multipart range to seek for the cache body reader.
+        ///
+        /// The body filter and seekable cache reader must advance through each
+        /// part together. If they diverge, the response body cannot be served
+        /// correctly; report an internal error rather than panic.
+        pub fn next_cache_multipart_range(&mut self) -> Result<Range<usize>> {
+            let RangeType::Multi(multipart_info) = &self.range else {
+                return Error::e_explain(
+                    InternalError,
+                    "tried to advance cache multipart range on a non-multipart response",
+                );
+            };
+
+            let cache_multipart_idx = self.cache_multipart_idx.map_or(0, |idx| idx + 1);
+            let Some(multipart_idx) = self.multipart_idx else {
+                return Error::e_explain(
+                    InternalError,
+                    "multipart response is missing body filter progress state",
+                );
+            };
+            if multipart_idx != cache_multipart_idx {
+                return Error::e_explain(
+                    InternalError,
+                    format!(
+                        "cache multipart progress mismatch: body_filter_idx={multipart_idx}, cache_reader_idx={cache_multipart_idx}, ranges={}",
+                        multipart_info.ranges.len(),
+                    ),
+                );
+            }
+
+            let Some(range) = multipart_info.ranges.get(cache_multipart_idx).cloned() else {
+                return Error::e_explain(
+                    InternalError,
+                    "cache multipart reader advanced past the final requested range",
+                );
+            };
+            self.cache_multipart_idx = Some(cache_multipart_idx);
+            Ok(range)
+        }
+
+        pub fn set_current_cursor(&mut self, current: usize) {
+            self.current = current;
+        }
+
+        pub fn set(&mut self, range: RangeType) {
+            self.multipart_idx = matches!(range, RangeType::Multi(_)).then_some(0);
+            self.range = range;
         }
 
         // Emit final boundary footer for multipart requests
@@ -1742,26 +2094,22 @@ pub mod range_filter {
 
     #[test]
     fn test_range_body_filter_single() {
-        let mut body_filter = RangeBodyFilter::new();
+        let mut body_filter = RangeBodyFilter::new_range(RangeType::None);
         assert_eq!(body_filter.filter_body(Some("123".into())).unwrap(), "123");
 
-        let mut body_filter = RangeBodyFilter::new();
-        body_filter.set(RangeType::Invalid);
+        let mut body_filter = RangeBodyFilter::new_range(RangeType::Invalid);
         assert!(body_filter.filter_body(Some("123".into())).is_none());
 
-        let mut body_filter = RangeBodyFilter::new();
-        body_filter.set(RangeType::new_single(0, 1));
+        let mut body_filter = RangeBodyFilter::new_range(RangeType::new_single(0, 1));
         assert_eq!(body_filter.filter_body(Some("012".into())).unwrap(), "0");
         assert!(body_filter.filter_body(Some("345".into())).is_none());
 
-        let mut body_filter = RangeBodyFilter::new();
-        body_filter.set(RangeType::new_single(4, 6));
+        let mut body_filter = RangeBodyFilter::new_range(RangeType::new_single(4, 6));
         assert!(body_filter.filter_body(Some("012".into())).is_none());
         assert_eq!(body_filter.filter_body(Some("345".into())).unwrap(), "45");
         assert!(body_filter.filter_body(Some("678".into())).is_none());
 
-        let mut body_filter = RangeBodyFilter::new();
-        body_filter.set(RangeType::new_single(1, 7));
+        let mut body_filter = RangeBodyFilter::new_range(RangeType::new_single(1, 7));
         assert_eq!(body_filter.filter_body(Some("012".into())).unwrap(), "12");
         assert_eq!(body_filter.filter_body(Some("345".into())).unwrap(), "345");
         assert_eq!(body_filter.filter_body(Some("678".into())).unwrap(), "6");
@@ -1961,6 +2309,51 @@ pub mod range_filter {
             "Missing final boundary"
         );
     }
+
+    #[test]
+    fn test_cache_multipart_advance_errors_when_reader_ends_part_early() {
+        let ranges = vec![0..10, 20..30];
+        let mut body_filter = RangeBodyFilter::new_range(RangeType::new_multi(ranges));
+
+        let first = body_filter.next_cache_multipart_range().unwrap();
+        assert_eq!(first, 0..10);
+        body_filter.set_current_cursor(first.start);
+
+        // The cache reader yielded only a prefix of the selected part before
+        // reporting EOF. The filter therefore has not advanced past part 0.
+        assert!(body_filter
+            .filter_body(Some(Bytes::from_static(b"01234")))
+            .is_some());
+
+        let err = body_filter.next_cache_multipart_range().unwrap_err();
+        assert_eq!(err.etype(), &InternalError);
+        assert!(err
+            .to_string()
+            .contains("cache multipart progress mismatch: body_filter_idx=0, cache_reader_idx=1"));
+    }
+
+    #[test]
+    fn test_cache_multipart_advance_errors_when_reader_overreads_part() {
+        let ranges = vec![0..2, 4..6, 8..10];
+        let mut body_filter = RangeBodyFilter::new_range(RangeType::new_multi(ranges));
+
+        let first = body_filter.next_cache_multipart_range().unwrap();
+        assert_eq!(first, 0..2);
+        body_filter.set_current_cursor(first.start);
+
+        // A seekable reader is expected to stop at the selected part's end.
+        // This chunk spans all requested parts and advances the filter beyond
+        // what the reader's seek state records.
+        assert!(body_filter
+            .filter_body(Some(Bytes::from_static(b"0123456789")))
+            .is_some());
+
+        let err = body_filter.next_cache_multipart_range().unwrap_err();
+        assert_eq!(err.etype(), &InternalError);
+        assert!(err
+            .to_string()
+            .contains("cache multipart progress mismatch: body_filter_idx=3, cache_reader_idx=1"));
+    }
 }
 
 // a state machine for proxy logic to tell when to use cache in the case of
@@ -2055,7 +2448,16 @@ impl ServeFromCache {
         &mut self,
         cache: &mut HttpCache,
         range: &mut RangeBodyFilter,
+        upgraded: bool,
     ) -> Result<HttpTask> {
+        fn body_task(data: Bytes, upgraded: bool) -> HttpTask {
+            if upgraded {
+                HttpTask::UpgradedBody(Some(data), false)
+            } else {
+                HttpTask::Body(Some(data), false)
+            }
+        }
+
         if !cache.enabled() {
             // Cache is disabled due to internal error
             // TODO: if nothing is sent to eyeball yet, figure out a way to recovery by
@@ -2081,26 +2483,42 @@ impl ServeFromCache {
                 Ok(HttpTask::Header(cache_hit_header(cache), true))
             }
             Self::CacheBody(should_seek) => {
+                log::trace!("cache body should seek: {should_seek}");
                 if *should_seek {
                     self.maybe_seek_hit_handler(cache, range)?;
                 }
-                if let Some(b) = cache.hit_handler().read_body().await? {
-                    Ok(HttpTask::Body(Some(b), false)) // false for now
-                } else {
-                    *self = Self::Done;
-                    Ok(HttpTask::Done)
+                loop {
+                    if let Some(b) = cache.hit_handler().read_body().await? {
+                        return Ok(body_task(b, upgraded));
+                    }
+                    // EOF from hit handler for body requested
+                    // if multipart, then seek again
+                    if range.should_cache_seek_again() {
+                        self.maybe_seek_hit_handler(cache, range)?;
+                    } else {
+                        *self = Self::Done;
+                        return Ok(HttpTask::Done);
+                    }
                 }
             }
             Self::CacheBodyMiss(should_seek) => {
                 if *should_seek {
                     self.maybe_seek_miss_handler(cache, range)?;
                 }
-                // safety: called of enable_miss() call it only if the async_body_reader exist
-                if let Some(b) = cache.miss_body_reader().unwrap().read_body().await? {
-                    Ok(HttpTask::Body(Some(b), false)) // false for now
-                } else {
-                    *self = Self::DoneMiss;
-                    Ok(HttpTask::Done)
+                // safety: caller of enable_miss() call it only if the async_body_reader exist
+                loop {
+                    if let Some(b) = cache.miss_body_reader().unwrap().read_body().await? {
+                        return Ok(body_task(b, upgraded));
+                    } else {
+                        // EOF from hit handler for body requested
+                        // if multipart, then seek again
+                        if range.should_cache_seek_again() {
+                            self.maybe_seek_miss_handler(cache, range)?;
+                        } else {
+                            *self = Self::DoneMiss;
+                            return Ok(HttpTask::Done);
+                        }
+                    }
                 }
             }
             Self::Done => Ok(HttpTask::Done),
@@ -2113,20 +2531,36 @@ impl ServeFromCache {
         cache: &mut HttpCache,
         range_filter: &mut RangeBodyFilter,
     ) -> Result<()> {
-        if let RangeType::Single(range) = &range_filter.range {
+        match &range_filter.range {
+            RangeType::Single(range) => {
+                // safety: called only if the async_body_reader exists
+                if cache.miss_body_reader().unwrap().can_seek() {
+                    cache
+                        .miss_body_reader()
+                        // safety: called only if the async_body_reader exists
+                        .unwrap()
+                        .seek(range.start, Some(range.end))
+                        .or_err(InternalError, "cannot seek miss handler")?;
+                    // Because the miss body reader is seeking, we no longer need the
+                    // RangeBodyFilter's help to return the requested byte range.
+                    range_filter.range = RangeType::None;
+                }
+            }
             // safety: called only if the async_body_reader exists
-            if cache.miss_body_reader().unwrap().can_seek() {
+            RangeType::Multi(_info) if cache.miss_body_reader().unwrap().can_seek_multipart() => {
+                let range = range_filter.next_cache_multipart_range()?;
                 cache
                     .miss_body_reader()
-                    // safety: called only if the async_body_reader exists
                     .unwrap()
-                    .seek(range.start, Some(range.end))
-                    .or_err(InternalError, "cannot seek miss handler")?;
-                // Because the miss body reader is seeking, we no longer need the
-                // RangeBodyFilter's help to return the requested byte range.
-                range_filter.range = RangeType::None;
+                    .seek_multipart(range.start, Some(range.end))
+                    .or_err(InternalError, "cannot seek hit handler for multirange")?;
+                // we still need RangeBodyFilter's help to transform the byte
+                // range into a multipart response.
+                range_filter.set_current_cursor(range.start);
             }
+            _ => {}
         }
+
         *self = Self::CacheBodyMiss(false);
         Ok(())
     }
@@ -2148,14 +2582,215 @@ impl ServeFromCache {
                     range_filter.range = RangeType::None;
                 }
             }
-            RangeType::Multi(_) => {
-                // For multipart ranges, we will handle the seeking in
-                // the body filter per part for now.
-                // TODO: implement seek for multipart range
+            RangeType::Multi(_info) if cache.hit_handler().can_seek_multipart() => {
+                let range = range_filter.next_cache_multipart_range()?;
+                cache
+                    .hit_handler()
+                    .seek_multipart(range.start, Some(range.end))
+                    .or_err(InternalError, "cannot seek hit handler for multirange")?;
+                // we still need RangeBodyFilter's help to transform the byte
+                // range into a multipart response.
+                range_filter.set_current_cursor(range.start);
             }
             _ => {}
         }
         *self = Self::CacheBody(false);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pingora_cache::{
+        predictor::{CacheablePredictor, Predictor},
+        CacheKey, CacheMeta, CachePhase, MemCache, RespCacheable,
+    };
+    use pingora_http::ResponseHeader;
+    use std::sync::{Arc, LazyLock};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    /// Stands in for a caller-defined `NoCacheReason::Custom` that has nothing to do with size.
+    const AUTHORIZATION_HEADER: &str = "AuthorizationHeader";
+
+    static CACHE_STORAGE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
+    static CACHE_PREDICTOR: LazyLock<Predictor<1>> = LazyLock::new(|| Predictor::new(10, None));
+
+    struct TestProxy;
+
+    #[async_trait]
+    impl ProxyHttp for TestProxy {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("test drives cache_http_task directly")
+        }
+
+        fn response_cache_filter(
+            &self,
+            _session: &Session,
+            resp: &ResponseHeader,
+            _ctx: &mut Self::CTX,
+        ) -> Result<RespCacheable> {
+            let now = SystemTime::now();
+            Ok(RespCacheable::Cacheable(CacheMeta::new(
+                now + Duration::from_secs(60),
+                now,
+                0,
+                0,
+                resp.clone(),
+            )))
+        }
+    }
+
+    /// Build a session that the predictor has bypassed, exactly as `proxy_cache` would:
+    /// the key is remembered as uncacheable for `reason`, so lookup is skipped.
+    async fn bypassed_session(
+        key: CacheKey,
+        reason: NoCacheReason,
+        max_file_size: usize,
+    ) -> Session {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .expect("test request should be written");
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("test request should parse");
+        session
+            .cache
+            .enable(&*CACHE_STORAGE, None, Some(&*CACHE_PREDICTOR), None, None);
+        session.cache.set_cache_key(key.clone());
+        session.cache.set_max_file_size_bytes(max_file_size);
+
+        CACHE_PREDICTOR.mark_uncacheable(&key, reason);
+        assert!(
+            !session.cache.cacheable_prediction(),
+            "predictor should bypass a key it just marked uncacheable"
+        );
+        session.cache.bypass();
+        session
+    }
+
+    /// A cacheable 200 with no `Content-Length`, i.e. an origin that chunks the body.
+    fn chunked_cacheable_response() -> ResponseHeader {
+        let mut resp = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        resp.insert_header(http::header::CACHE_CONTROL, "max-age=60")
+            .unwrap();
+        resp
+    }
+
+    async fn run_header_task(session: &mut Session, resp: ResponseHeader) {
+        let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
+        proxy
+            .cache_http_task(
+                session,
+                &HttpTask::Header(Box::new(resp), true),
+                &mut (),
+                &mut ServeFromCache::new(),
+            )
+            .await
+            .expect("cache_http_task should succeed");
+    }
+
+    /// A predictor bypass that had nothing to do with size must not be reported as
+    /// PredictedResponseTooLarge, and must not cost the request a wasted bypass.
+    #[tokio::test]
+    async fn non_size_bypass_admits_and_clears_predictor() {
+        for reason in [
+            NoCacheReason::Custom(AUTHORIZATION_HEADER),
+            NoCacheReason::OriginNotCache,
+        ] {
+            let key = CacheKey::new(format!("/non-size-bypass/{}", reason.as_str()), "");
+            let mut session = bypassed_session(key.clone(), reason, 1024).await;
+
+            run_header_task(&mut session, chunked_cacheable_response()).await;
+
+            assert_eq!(
+                session.cache.phase(),
+                CachePhase::Miss,
+                "bypass remembered for {reason:?} should admit this response, got {:?}",
+                session.cache.phase()
+            );
+            assert!(
+                CACHE_PREDICTOR.cacheable_prediction(&key),
+                "bypass remembered for {reason:?} should be cleared once the response came back cacheable"
+            );
+        }
+    }
+
+    /// The deferral only exists to protect against a response that already blew the size
+    /// limit once. That case still defers, and still reports the reason it acted on.
+    #[tokio::test]
+    async fn size_bypass_defers_when_length_is_unknown() {
+        let key = CacheKey::new("/size-bypass-chunked", "");
+        let mut session =
+            bypassed_session(key.clone(), NoCacheReason::ResponseTooLarge, 1024).await;
+
+        run_header_task(&mut session, chunked_cacheable_response()).await;
+
+        assert_eq!(
+            session.cache.phase(),
+            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
+        );
+        assert!(
+            !CACHE_PREDICTOR.cacheable_prediction(&key),
+            "the response body has not been measured yet, so the key stays marked"
+        );
+    }
+
+    /// With a Content-Length the size is known up front, so even a size bypass can admit.
+    #[tokio::test]
+    async fn size_bypass_admits_when_length_is_known() {
+        let key = CacheKey::new("/size-bypass-with-length", "");
+        let mut session =
+            bypassed_session(key.clone(), NoCacheReason::ResponseTooLarge, 1024).await;
+
+        let mut resp = chunked_cacheable_response();
+        resp.insert_header(CONTENT_LENGTH, "5").unwrap();
+        run_header_task(&mut session, resp).await;
+
+        assert_eq!(session.cache.phase(), CachePhase::Miss);
+    }
+
+    /// Without a predictor reason there is nothing to act on, so the conservative
+    /// deferral stays in place.
+    #[tokio::test]
+    async fn unknown_bypass_reason_stays_conservative() {
+        let key = CacheKey::new("/unknown-bypass-reason", "");
+        // Bypass without the predictor remembering anything, e.g. a caller that bypassed
+        // for its own reasons.
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session.read_request().await.unwrap();
+        session
+            .cache
+            .enable(&*CACHE_STORAGE, None, Some(&*CACHE_PREDICTOR), None, None);
+        session.cache.set_cache_key(key);
+        session.cache.set_max_file_size_bytes(1024);
+        session.cache.bypass();
+        assert_eq!(session.cache.predicted_uncacheable_reason(), None);
+
+        run_header_task(&mut session, chunked_cacheable_response()).await;
+
+        assert_eq!(
+            session.cache.phase(),
+            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
+        );
     }
 }

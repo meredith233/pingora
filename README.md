@@ -32,6 +32,7 @@ API docs are also available for all the crates.
 # Notable crates in this workspace
 * Pingora: the "public facing" crate to build networked systems and proxies
 * Pingora-core: this crate defines the protocols, functionalities and basic traits
+* Pingora-foundations: Foundations telemetry integration for Pingora services
 * Pingora-proxy: the logic and APIs to build HTTP proxies
 * Pingora-error: the common error type used across Pingora crates
 * Pingora-http: the HTTP header definitions and APIs
@@ -59,13 +60,11 @@ Both x86_64 and aarch64 architectures will be supported.
 
 ## Rust version
 
-Pingora keeps a rolling MSRV (minimum supported Rust version) policy of 6 months. This means we will accept PRs that upgrade the MSRV as long as the new Rust version used is at least 6 months old.
+Pingora keeps a rolling MSRV (minimum supported Rust version) policy of 6 months. This means we will accept PRs that upgrade the MSRV as long as the new Rust version used is at least 6 months old. However, we generally will not bump the highest MSRV across the workspace without a sufficiently compelling reason.
 
-Our current MSRV is effectively 1.82.
+Our current MSRV is 1.85.
 
-Previously Pingora advertised an MSRV of 1.72. Older Rust versions may still be able to compile via `cargo update` pinning dependencies such as `backtrace@0.3.74`. The advertised MSRV in config files will be officially bumped to 1.82 in an upcoming release.
-
-Building with the optional feature `boringssl` with Boring >= 4.14 requires Rust 1.80.
+Currently not all crates enforce `rust-version` as it is possible to use some crates on lower versions.
 
 ## Build Requirements
 

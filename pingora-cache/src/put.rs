@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,8 @@ use bytes::Bytes;
 use http::header;
 use log::warn;
 use pingora_core::protocols::http::{
-    v1::common::header_value_content_length, HttpTask, ServerSession,
+    custom::server::Session as DownstreamSession, v1::common::header_value_content_length,
+    HttpTask, ServerSession,
 };
 use pingora_error::Error;
 
@@ -34,6 +35,9 @@ pub trait CachePut {
 
     /// Return the [CacheMetaDefaults]
     fn cache_defaults() -> &'static CacheMetaDefaults;
+
+    /// Put interesting things in the span given the parsed response header.
+    fn trace_header(&mut self, _response: &ResponseHeader) {}
 }
 
 use parse_response::ResponseParse;
@@ -81,11 +85,13 @@ impl<C: CachePut> CachePutCtx<C> {
     }
 
     async fn put_header(&mut self, meta: CacheMeta) -> Result<()> {
-        let trace = self.trace.child("cache put header", |o| o.start()).handle();
+        #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
+        let mut trace = self.trace.child("cache put header", |o| o.start());
         let miss_handler = self
             .storage
-            .get_miss_handler(&self.key, &meta, &trace)
+            .get_miss_handler(&self.key, &meta, &trace.handle())
             .await?;
+        trace::tag_span_with_meta(&mut trace, &meta);
         self.miss_handler = Some(miss_handler);
         self.meta = Some(meta);
         Ok(())
@@ -116,14 +122,19 @@ impl<C: CachePut> CachePutCtx<C> {
             // no miss_handler, uncacheable
             return Ok(());
         };
+        // Save the entry ID before `finish` consumes the miss handler.
+        let entry_id = miss_handler.entry_id();
         let finish = miss_handler.finish().await?;
         if let Some(eviction) = self.eviction.as_ref() {
             let cache_key = self.key.to_compact();
             let meta = self.meta.as_ref().unwrap();
+            let entry_key = crate::eviction::CacheEntryKey::from_entry_id(cache_key, entry_id);
             let evicted = match finish {
-                MissFinishType::Appended(delta) => eviction.increment_weight(cache_key, delta),
+                MissFinishType::Appended(delta, max_size) => {
+                    eviction.increment_weight(&entry_key, delta, max_size)
+                }
                 MissFinishType::Created(size) => {
-                    eviction.admit(cache_key, size, meta.0.internal.fresh_until)
+                    eviction.admit(entry_key, size, meta.0.internal.fresh_until)
                 }
             };
             // actual eviction can be done async
@@ -134,8 +145,9 @@ impl<C: CachePut> CachePutCtx<C> {
             let storage = self.storage;
             tokio::task::spawn(async move {
                 for item in evicted {
-                    if let Err(e) = storage.purge(&item, PurgeType::Eviction, &trace).await {
-                        warn!("Failed to purge {item} during eviction for cache put: {e}");
+                    let target = crate::storage::PurgeTarget::Exact(&item);
+                    if let Err(e) = storage.purge(target, PurgeType::Eviction, &trace).await {
+                        warn!("Failed to purge {target} during eviction for cache put: {e}");
                     }
                 }
             });
@@ -144,29 +156,48 @@ impl<C: CachePut> CachePutCtx<C> {
         Ok(())
     }
 
+    fn trace_header(&mut self, header: &ResponseHeader) {
+        self.trace.set_tag(|| {
+            Tag::new(
+                "cache-control",
+                header
+                    .headers
+                    .get_all(http::header::CACHE_CONTROL)
+                    .into_iter()
+                    .map(|v| String::from_utf8_lossy(v.as_bytes()).to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        });
+    }
+
     async fn do_cache_put(&mut self, data: &[u8]) -> Result<Option<NoCacheReason>> {
         let tasks = self.parser.inject_data(data)?;
         for task in tasks {
             match task {
-                HttpTask::Header(header, _eos) => match self.cache_put.cacheable(*header) {
-                    RespCacheable::Cacheable(meta) => {
-                        if let Some(max_file_size_tracker) = &self.max_file_size_tracker {
-                            let content_length_hdr = meta.headers().get(header::CONTENT_LENGTH);
-                            if let Some(content_length) =
-                                header_value_content_length(content_length_hdr)
-                            {
-                                if content_length > max_file_size_tracker.max_file_size_bytes() {
-                                    return Ok(Some(NoCacheReason::ResponseTooLarge));
+                HttpTask::Header(header, _eos) => {
+                    self.trace_header(&header);
+                    match self.cache_put.cacheable(*header) {
+                        RespCacheable::Cacheable(meta) => {
+                            if let Some(max_file_size_tracker) = &self.max_file_size_tracker {
+                                let content_length_hdr = meta.headers().get(header::CONTENT_LENGTH);
+                                if let Some(content_length) =
+                                    header_value_content_length(content_length_hdr)
+                                {
+                                    if content_length > max_file_size_tracker.max_file_size_bytes()
+                                    {
+                                        return Ok(Some(NoCacheReason::ResponseTooLarge));
+                                    }
                                 }
                             }
-                        }
 
-                        self.put_header(meta).await?;
+                            self.put_header(meta).await?;
+                        }
+                        RespCacheable::Uncacheable(reason) => {
+                            return Ok(Some(reason));
+                        }
                     }
-                    RespCacheable::Uncacheable(reason) => {
-                        return Ok(Some(reason));
-                    }
-                },
+                }
                 HttpTask::Body(data, eos) => {
                     if let Some(data) = data {
                         self.put_body(data, eos).await?;
@@ -186,9 +217,9 @@ impl<C: CachePut> CachePutCtx<C> {
     /// Return:
     /// - `Ok(None)` when the payload will be cache.
     /// - `Ok(Some(reason))` when the payload is not cacheable
-    pub async fn cache_put(
+    pub async fn cache_put<DS: DownstreamSession>(
         &mut self,
-        session: &mut ServerSession,
+        session: &mut ServerSession<DS>,
     ) -> Result<Option<NoCacheReason>> {
         let mut no_cache_reason = None;
         while let Some(data) = session.read_request_body().await? {
@@ -214,7 +245,7 @@ impl<C: CachePut> CachePutCtx<C> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use cf_rustracing::span::Span;
+    use crate::trace::Span;
     use once_cell::sync::Lazy;
 
     struct TestCachePut();
@@ -231,7 +262,7 @@ mod test {
 
     #[tokio::test]
     async fn test_cache_put() {
-        let key = CacheKey::new("", "a", "1");
+        let key = CacheKey::new("a", "1");
         let span = Span::inactive();
         let put = TestCachePut();
         let mut ctx = TestCachePutCtx::new(put, key.clone(), &*CACHE_BACKEND, None, span);
@@ -265,7 +296,7 @@ mod test {
 
     #[tokio::test]
     async fn test_cache_put_uncacheable() {
-        let key = CacheKey::new("", "a", "1");
+        let key = CacheKey::new("a", "1");
         let span = Span::inactive();
         let put = TestCachePut();
         let mut ctx = TestCachePutCtx::new(put, key.clone(), &*CACHE_BACKEND, None, span);
@@ -286,7 +317,7 @@ mod test {
 
     #[tokio::test]
     async fn test_cache_put_204_invalid_body() {
-        let key = CacheKey::new("", "b", "1");
+        let key = CacheKey::new("b", "1");
         let span = Span::inactive();
         let put = TestCachePut();
         let mut ctx = TestCachePutCtx::new(put, key.clone(), &*CACHE_BACKEND, None, span);
@@ -326,7 +357,7 @@ mod test {
 
     #[tokio::test]
     async fn test_cache_put_extra_body() {
-        let key = CacheKey::new("", "c", "1");
+        let key = CacheKey::new("c", "1");
         let span = Span::inactive();
         let put = TestCachePut();
         let mut ctx = TestCachePutCtx::new(put, key.clone(), &*CACHE_BACKEND, None, span);
@@ -369,6 +400,7 @@ mod test {
 
 mod parse_response {
     use super::*;
+    use bstr::ByteSlice;
     use bytes::BytesMut;
     use httparse::Status;
     use pingora_error::{
@@ -475,7 +507,7 @@ mod parse_response {
                     self.state = ParseState::Invalid(e);
                     return Error::e_because(
                         InvalidHTTPHeader,
-                        format!("buf: {:?}", String::from_utf8_lossy(&self.buf)),
+                        format!("buf: {:?}", self.buf.as_bstr()),
                         e,
                     );
                 }
@@ -494,7 +526,8 @@ mod parse_response {
             for header in resp.headers {
                 // TODO: consider hold a Bytes and all header values can be Bytes referencing the
                 // original buffer without reallocation
-                response.append_header(header.name.to_owned(), header.value.to_owned())?;
+                let header_value = pingora_http::header_value_from_slice(header.value);
+                response.append_header(header.name.to_owned(), header_value)?;
             }
             // TODO: see above, we can make header value `Bytes` referencing header_bytes
             let header_bytes = self.buf.split_to(split_to).freeze();

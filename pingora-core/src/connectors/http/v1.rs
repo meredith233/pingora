@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@ use crate::protocols::http::v1::client::HttpSession;
 use crate::upstreams::peer::Peer;
 
 use pingora_error::Result;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub struct Connector {
@@ -35,7 +37,7 @@ impl Connector {
         peer: &P,
     ) -> Result<(HttpSession, bool)> {
         let (stream, reused) = self.transport.get_stream(peer).await?;
-        let http = HttpSession::new(stream);
+        let http = HttpSession::new_with_options(stream, peer);
         Ok((http, reused))
     }
 
@@ -43,10 +45,9 @@ impl Connector {
         &self,
         peer: &P,
     ) -> Option<HttpSession> {
-        self.transport
-            .reused_stream(peer)
-            .await
-            .map(HttpSession::new)
+        let stream = self.transport.reused_stream(peer).await?;
+        let http = HttpSession::new_with_options(stream, peer);
+        Some(http)
     }
 
     pub async fn release_http_session<P: Peer + Send + Sync + 'static>(
@@ -61,6 +62,17 @@ impl Connector {
                 .release_stream(stream, peer.reuse_hash(), idle_timeout);
         }
     }
+
+    /// Return the number of times a pooled connection was found to contain
+    /// unexpected data from the server.
+    pub fn unexpected_data_connection_count(&self) -> u64 {
+        self.transport.unexpected_data_connection_count()
+    }
+
+    /// Return a shared reference to the unexpected data connection counter for periodic metric reporting.
+    pub fn unexpected_data_connection_counter(&self) -> Arc<AtomicU64> {
+        self.transport.unexpected_data_connection_counter()
+    }
 }
 
 #[cfg(test)]
@@ -68,7 +80,10 @@ mod tests {
     use super::*;
     use crate::protocols::l4::socket::SocketAddr;
     use crate::upstreams::peer::HttpPeer;
+    use crate::upstreams::peer::Peer;
     use pingora_http::RequestHeader;
+    use std::fmt::{Display, Formatter, Result as FmtResult};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn get_http(http: &mut HttpSession, expected_status: u16) {
         let mut req = Box::new(RequestHeader::build("GET", b"/", None).unwrap());
@@ -100,6 +115,101 @@ mod tests {
         connector.release_http_session(http, &peer, None).await;
         let (_, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(reused);
+    }
+
+    #[tokio::test]
+    async fn malformed_response_is_not_returned_to_pool() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request_byte = [0];
+            stream.read_exact(&mut request_byte).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+ZZ\r\n",
+                )
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let connector = Connector::new(None);
+        let peer = HttpPeer::new(address, false, "".into());
+        let (mut http, reused) = connector.get_http_session(&peer).await.unwrap();
+        assert!(!reused);
+
+        let request = RequestHeader::build("GET", b"/", None).unwrap();
+        http.write_request_header(Box::new(request)).await.unwrap();
+        assert!(matches!(
+            http.read_response_task().await.unwrap(),
+            crate::protocols::http::HttpTask::Header(_, false)
+        ));
+        assert!(http.read_response_task().await.is_err());
+
+        connector.release_http_session(http, &peer, None).await;
+        assert!(connector.reused_http_session(&peer).await.is_none());
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_reuse_rejects_fd_mismatch() {
+        use std::os::unix::prelude::AsRawFd;
+
+        #[derive(Clone)]
+        struct MismatchPeer {
+            reuse_hash: u64,
+            address: SocketAddr,
+        }
+
+        impl Display for MismatchPeer {
+            fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+                write!(f, "{:?}", self.address)
+            }
+        }
+
+        impl Peer for MismatchPeer {
+            fn address(&self) -> &SocketAddr {
+                &self.address
+            }
+
+            fn tls(&self) -> bool {
+                false
+            }
+
+            fn sni(&self) -> &str {
+                ""
+            }
+
+            fn reuse_hash(&self) -> u64 {
+                self.reuse_hash
+            }
+
+            fn matches_fd<V: AsRawFd>(&self, _fd: V) -> bool {
+                false
+            }
+        }
+
+        let connector = Connector::new(None);
+        let peer = HttpPeer::new(("1.1.1.1", 80), false, "".into());
+        let (mut http, reused) = connector.get_http_session(&peer).await.unwrap();
+        assert!(!reused);
+        get_http(&mut http, 301).await;
+        connector.release_http_session(http, &peer, None).await;
+
+        let mismatch_peer = MismatchPeer {
+            reuse_hash: peer.reuse_hash(),
+            address: peer.address().clone(),
+        };
+
+        assert!(connector
+            .reused_http_session(&mismatch_peer)
+            .await
+            .is_none());
     }
 
     #[tokio::test]

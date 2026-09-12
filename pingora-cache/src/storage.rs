@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,12 +15,14 @@
 //! Cache backend storage abstraction
 
 use super::{CacheKey, CacheMeta};
+use crate::eviction::{CacheEntryId, CacheEntryKey, CacheEntryKeyRef};
 use crate::key::CompactCacheKey;
 use crate::trace::SpanHandle;
 
 use async_trait::async_trait;
 use pingora_error::Result;
 use std::any::Any;
+use std::fmt::{Display, Formatter, Result as FmtResult};
 
 /// The reason a purge() is called
 #[derive(Debug, Clone, Copy)]
@@ -29,6 +31,112 @@ pub enum PurgeType {
     Eviction,
     // For cache invalidation
     Invalidation,
+}
+
+/// What a purge is asked to do to the entry it targets.
+///
+/// This is separate from [`PurgeType`], which says why the purge happened rather than what it
+/// does to the entry, and from [`PurgeOutcome`], which is what storage actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgeAction {
+    /// Remove the entry, so the next read for its key is a miss.
+    Delete,
+    /// Keep the entry but mark it stale, so it revalidates against the origin instead of being
+    /// refetched, reusing the stored body when the origin answers 304.
+    Expire,
+}
+
+/// The entry a [`Storage::purge`] call should remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgeTarget<'a> {
+    /// Remove storage's current entry for this logical cache key.
+    ///
+    /// This targets one entry. Storage that retains multiple generations for a logical key does
+    /// not need to remove inactive generations. Storage must not remove an entry with a different
+    /// logical key. When storage retains multiple generations, it may select which identity to
+    /// remove.
+    Active(&'a CompactCacheKey),
+    /// Remove this exact cache entry.
+    ///
+    /// Storage must match the complete identity, including any [`CacheEntryId`].
+    Exact(&'a CacheEntryKey),
+}
+
+impl Display for PurgeTarget<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Self::Active(key) => write!(f, "active entry for {key}"),
+            Self::Exact(entry) => write!(f, "{entry}"),
+        }
+    }
+}
+
+impl<'a> PurgeTarget<'a> {
+    /// Return the target's logical cache key.
+    pub fn key(self) -> &'a CompactCacheKey {
+        match self {
+            Self::Active(key) => key,
+            Self::Exact(entry) => entry.key(),
+        }
+    }
+
+    /// Return a borrowed identity for the removed entry.
+    ///
+    /// `id` supplies identity discovered while resolving a [`PurgeTarget::Active`] target. It is
+    /// ignored for a [`PurgeTarget::Exact`] target, which already contains the complete identity;
+    /// if supplied, it must match that identity.
+    pub fn removed_entry(self, id: Option<CacheEntryId>) -> CacheEntryKeyRef<'a> {
+        match self {
+            Self::Active(key) => CacheEntryKeyRef::from_entry_id(key, id),
+            Self::Exact(entry) => {
+                debug_assert!(
+                    id.is_none() || id == entry.entry_id(),
+                    "purge outcome ID {id:?} must match exact target ID {:?}",
+                    entry.entry_id()
+                );
+                entry.into()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_removed_entry_accepts_absent_or_matching_id() {
+        let id = CacheEntryId::new(42);
+        let entry = CacheEntryKey::identified(CompactCacheKey::default(), id);
+        let target = PurgeTarget::Exact(&entry);
+
+        assert_eq!(target.removed_entry(None), (&entry).into());
+        assert_eq!(target.removed_entry(Some(id)), (&entry).into());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "must match exact target ID")]
+    fn exact_removed_entry_rejects_mismatched_id() {
+        let entry = CacheEntryKey::identified(CompactCacheKey::default(), CacheEntryId::new(42));
+        PurgeTarget::Exact(&entry).removed_entry(Some(CacheEntryId::new(43)));
+    }
+}
+
+/// Outcome of a successful [`Storage::purge`] or [`Storage::expire`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgeOutcome {
+    /// Storage did not find the target entry.
+    NotFound,
+    /// Storage removed an entry, with the ID selected for an active target, if any.
+    ///
+    /// Exact targets already contain the complete identity and need not repeat their ID here.
+    Purged(Option<CacheEntryId>),
+    /// Storage kept the entry and marked it stale.
+    ///
+    /// Only [`Storage::expire`] returns this. The entry is still stored, so the eviction manager
+    /// keeps tracking it.
+    Expired,
 }
 
 /// Cache storage interface
@@ -72,15 +180,56 @@ pub trait Storage {
         trace: &SpanHandle,
     ) -> Result<MissHandler>;
 
-    /// Delete the cached asset for the given key
+    /// Delete one cached entry for the given target.
     ///
-    /// [CompactCacheKey] is used here because it is how eviction managers store the keys
+    /// [`PurgeTarget::Active`] asks storage to select one active entry for a logical cache key; it
+    /// does not request removal of every retained generation. [`PurgeTarget::Exact`] identifies the
+    /// exact entry to remove.
+    ///
+    /// When resolving an active target, storage must return the storage-defined ID of the entry it
+    /// actually removed in [`PurgeOutcome::Purged`]. If [`HandleHit::entry_id`] or
+    /// [`HandleMiss::entry_id`] returns `Some`, an active purge outcome must contain that
+    /// [`CacheEntryId`]. Returning `None` would leave the identified entry tracked by the eviction
+    /// manager. Exact targets already contain the complete identity.
     async fn purge(
         &'static self,
-        key: &CompactCacheKey,
+        target: PurgeTarget<'_>,
         purge_type: PurgeType,
         trace: &SpanHandle,
-    ) -> Result<bool>;
+    ) -> Result<PurgeOutcome>;
+
+    /// Mark one cached entry stale so it revalidates, keeping the entry stored.
+    ///
+    /// Targets resolve the same way as [`Storage::purge`]. Once this returns
+    /// [`PurgeOutcome::Expired`], the entry that was stored when the call ran must not be served
+    /// as a fresh hit, and its body should stay usable so a revalidation can reuse it on a 304.
+    ///
+    /// Stale is not the same as unusable. Whether a reader is served the stale body while it
+    /// revalidates is up to the entry's serve stale windows, which this does not touch.
+    /// How that is recorded is up to storage: rewriting the stored freshness and applying it on
+    /// read both satisfy the contract.
+    ///
+    /// This is deliberately not [`Storage::update_meta`]. That call needs a full [`CacheKey`] and
+    /// a [`CacheMeta`] the caller already holds from a hit, and a purge has neither. It would also
+    /// pin the recording strategy to rewriting the stored meta, turning this into a read modify
+    /// write that a concurrent revalidation can clobber.
+    ///
+    /// The guarantee covers the stored entry, not a fill already in flight. A miss handler that
+    /// commits after this returns may replace the entry with a fresh one, which is the same race
+    /// [`Storage::purge`] has and is expected to be resolved by whatever serializes writes for
+    /// that key.
+    ///
+    /// The default deletes the entry instead. Storage that cannot mark an entry stale must still
+    /// keep the next read from serving it, and deleting gives that guarantee at the cost of a
+    /// full refetch. It reports [`PurgeOutcome::Purged`] so the caller knows the entry is gone
+    /// and the eviction manager stops tracking it.
+    async fn expire(
+        &'static self,
+        target: PurgeTarget<'_>,
+        trace: &SpanHandle,
+    ) -> Result<PurgeOutcome> {
+        self.purge(target, PurgeType::Invalidation, trace).await
+    }
 
     /// Update cache header and metadata for the already stored asset.
     async fn update_meta(
@@ -117,18 +266,39 @@ pub trait HandleHit {
         trace: &SpanHandle,
     ) -> Result<()>;
 
-    /// Whether this storage allow seeking to a certain range of body
+    /// Whether this storage allows seeking to a certain range of body for single ranges.
     fn can_seek(&self) -> bool {
         false
     }
 
-    /// Try to seek to a certain range of the body
+    /// Whether this storage allows seeking to a certain range of body for multipart ranges.
+    ///
+    /// By default uses the `can_seek` implementation.
+    fn can_seek_multipart(&self) -> bool {
+        self.can_seek()
+    }
+
+    /// Try to seek to a certain range of the body for single ranges.
     ///
     /// `end: None` means to read to the end of the body.
     fn seek(&mut self, _start: usize, _end: Option<usize>) -> Result<()> {
         // to prevent impl can_seek() without impl seek
         todo!("seek() needs to be implemented")
     }
+
+    /// Try to seek to a certain range of the body for multipart ranges.
+    ///
+    /// Works in an identical manner to `seek()`.
+    ///
+    /// `end: None` means to read to the end of the body.
+    ///
+    /// By default uses the `seek` implementation, but hit handlers may customize the
+    /// implementation specifically to anticipate multipart requests.
+    fn seek_multipart(&mut self, start: usize, end: Option<usize>) -> Result<()> {
+        // to prevent impl can_seek() without impl seek
+        self.seek(start, end)
+    }
+
     // TODO: fn is_stream_hit()
 
     /// Should we count this hit handler instance as an access in the eviction manager.
@@ -149,6 +319,19 @@ pub trait HandleHit {
         0
     }
 
+    /// Return the identity of this entry to the eviction manager.
+    ///
+    /// Storage that identifies a stored generation beyond its
+    /// [`crate::key::CompactCacheKey`] can return that identity here so access accounting targets
+    /// the exact entry. Storage that keys eviction only on the cache key should leave this at the
+    /// default `None`.
+    ///
+    /// Storage that identifies entries must implement both this method and
+    /// [`HandleMiss::entry_id`] using the same identity scheme.
+    fn entry_id(&self) -> Option<CacheEntryId> {
+        None
+    }
+
     /// Helper function to cast the trait object to concrete types
     fn as_any(&self) -> &(dyn Any + Send + Sync);
 
@@ -157,12 +340,14 @@ pub trait HandleHit {
 }
 
 /// Hit Handler
-pub type HitHandler = Box<(dyn HandleHit + Sync + Send)>;
+pub type HitHandler = Box<dyn HandleHit + Sync + Send>;
 
 /// MissFinishType
 pub enum MissFinishType {
+    /// A new asset was created with the given size.
     Created(usize),
-    Appended(usize),
+    /// Appended size to existing asset, with an optional max size param.
+    Appended(usize, Option<usize>),
 }
 
 /// Cache miss handling trait
@@ -194,10 +379,24 @@ pub trait HandleMiss {
     fn streaming_write_tag(&self) -> Option<&[u8]> {
         None
     }
+
+    /// Return the identity of the entry produced by this write to the eviction manager.
+    ///
+    /// Storage that identifies a stored generation beyond its
+    /// [`crate::key::CompactCacheKey`] should return that identity here so admission and weight
+    /// updates target the entry that storage will produce. Storage that keys eviction only on the
+    /// cache key should leave this at the default `None`.
+    ///
+    /// The value must identify the committed entry and remain valid after [`Self::finish`]. It
+    /// must not identify only temporary write state. Storage that identifies entries must implement
+    /// both this method and [`HandleHit::entry_id`] using the same identity scheme.
+    fn entry_id(&self) -> Option<CacheEntryId> {
+        None
+    }
 }
 
 /// Miss Handler
-pub type MissHandler = Box<(dyn HandleMiss + Sync + Send)>;
+pub type MissHandler = Box<dyn HandleMiss + Sync + Send>;
 
 pub mod streaming_write {
     /// Portable u64 (sized) write id convenience type for use with streaming writes.

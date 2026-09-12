@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,11 +20,16 @@
 
 use crate::apps::ServerApp;
 use crate::listeners::tls::TlsSettings;
-use crate::listeners::{Listeners, ServerAddress, TcpSocketOptions, TransportStack};
+#[cfg(feature = "connection_filter")]
+use crate::listeners::AcceptAllFilter;
+use crate::listeners::{
+    ConnectionFilter, ListenerConfig, Listeners, ServerAddress, TcpSocketOptions, TransportStack,
+};
+use crate::protocols::http::custom::server::Session as CustomServerSession;
 use crate::protocols::Stream;
 #[cfg(unix)]
 use crate::server::ListenFds;
-use crate::server::ShutdownWatch;
+use crate::server::{RuntimeOpts, ShutdownWatch};
 use crate::services::Service as ServiceTrait;
 
 use async_trait::async_trait;
@@ -33,39 +38,105 @@ use pingora_error::Result;
 use pingora_runtime::current_handle;
 use pingora_timeout::timeout;
 use std::fs::Permissions;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Override the runtime options used to run a listening service.
+pub type RuntimeOptsOverride = Arc<dyn Fn(&RuntimeOpts) -> Option<RuntimeOpts> + Send + Sync>;
+
 /// The type of service that is associated with a list of listening endpoints and a particular application
-pub struct Service<A> {
+pub struct Service<A, DS = ()>
+where
+    DS: CustomServerSession,
+{
     name: String,
     listeners: Listeners,
     app_logic: Option<A>,
+    _custom_session: PhantomData<fn() -> DS>,
     /// The number of preferred threads. `None` to follow global setting.
     pub threads: Option<usize>,
+    runtime_opts_override: Option<RuntimeOptsOverride>,
+    #[cfg(feature = "connection_filter")]
+    connection_filter: Arc<dyn ConnectionFilter>,
 }
 
-impl<A> Service<A> {
-    /// Create a new [`Service`] with the given application (see [`crate::apps`]).
-    pub fn new(name: String, app_logic: A) -> Self {
+impl<A, DS> Service<A, DS>
+where
+    DS: CustomServerSession,
+{
+    /// Create a new [`Service`] with a concrete custom downstream session type.
+    pub fn new_with_custom_session(name: String, app_logic: A) -> Self {
         Service {
             name,
             listeners: Listeners::new(),
             app_logic: Some(app_logic),
+            _custom_session: PhantomData,
             threads: None,
+            runtime_opts_override: None,
+            #[cfg(feature = "connection_filter")]
+            connection_filter: Arc::new(AcceptAllFilter),
         }
     }
 
-    /// Create a new [`Service`] with the given application (see [`crate::apps`]) and the given
-    /// [`Listeners`].
-    pub fn with_listeners(name: String, listeners: Listeners, app_logic: A) -> Self {
+    /// Create a new [`Service`] with listeners and a concrete custom downstream session type.
+    pub fn with_listeners_and_custom_session(
+        name: String,
+        listeners: Listeners,
+        app_logic: A,
+    ) -> Self {
         Service {
             name,
             listeners,
             app_logic: Some(app_logic),
+            _custom_session: PhantomData,
             threads: None,
+            runtime_opts_override: None,
+            #[cfg(feature = "connection_filter")]
+            connection_filter: Arc::new(AcceptAllFilter),
         }
     }
+
+    /// Set a runtime options override for this service.
+    ///
+    /// Returning [`None`] from the override uses the global runtime options.
+    pub fn set_runtime_opts_override(&mut self, override_fn: RuntimeOptsOverride) {
+        self.runtime_opts_override = Some(override_fn);
+    }
+
+    /// Set a custom connection filter for this service.
+    ///
+    /// The connection filter will be applied to all incoming connections
+    /// on all endpoints of this service. Connections that don't pass the
+    /// filter will be dropped immediately at the TCP level, before TLS
+    /// handshake or any HTTP processing.
+    ///
+    /// # Feature Flag
+    ///
+    /// This method requires the `connection_filter` feature to be enabled.
+    /// When the feature is disabled, this method is a no-op.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use std::sync::Arc;
+    /// # use pingora_core::listeners::{ConnectionFilter, AcceptAllFilter};
+    /// # struct MyService;
+    /// # impl MyService {
+    /// #   fn new() -> Self { MyService }
+    /// # }
+    /// let mut service = MyService::new();
+    /// let filter = Arc::new(AcceptAllFilter);
+    /// service.set_connection_filter(filter);
+    /// ```
+    #[cfg(feature = "connection_filter")]
+    pub fn set_connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) {
+        self.connection_filter = filter.clone();
+        self.listeners.set_connection_filter(filter);
+    }
+
+    #[cfg(not(feature = "connection_filter"))]
+    pub fn set_connection_filter(&mut self, _filter: Arc<dyn ConnectionFilter>) {}
 
     /// Get the [`Listeners`], mostly to add more endpoints.
     pub fn endpoints(&mut self) -> &mut Listeners {
@@ -77,6 +148,11 @@ impl<A> Service<A> {
     /// Add a TCP listening endpoint with the given address (e.g., `127.0.0.1:8000`).
     pub fn add_tcp(&mut self, addr: &str) {
         self.listeners.add_tcp(addr);
+    }
+
+    /// Add a listening endpoint configured by a [`ListenerConfig`].
+    pub fn add_listener(&mut self, endpoint: ListenerConfig) {
+        self.listeners.add_listener(endpoint);
     }
 
     /// Add a TCP listening endpoint with the given [`TcpSocketOptions`].
@@ -125,7 +201,24 @@ impl<A> Service<A> {
     }
 }
 
-impl<A: ServerApp + Send + Sync + 'static> Service<A> {
+impl<A> Service<A, ()> {
+    /// Create a new [`Service`] with the given application (see [`crate::apps`]).
+    pub fn new(name: String, app_logic: A) -> Self {
+        Self::new_with_custom_session(name, app_logic)
+    }
+
+    /// Create a new [`Service`] with the given application (see [`crate::apps`]) and the given
+    /// [`Listeners`].
+    pub fn with_listeners(name: String, listeners: Listeners, app_logic: A) -> Self {
+        Self::with_listeners_and_custom_session(name, listeners, app_logic)
+    }
+}
+
+impl<A, DS> Service<A, DS>
+where
+    A: ServerApp<DS> + Send + Sync + 'static,
+    DS: CustomServerSession,
+{
     pub async fn handle_event(event: Stream, app_logic: Arc<A>, shutdown: ShutdownWatch) {
         debug!("new event!");
         let mut reuse_event = app_logic.process_new(event, &shutdown).await;
@@ -213,7 +306,11 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
 }
 
 #[async_trait]
-impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
+impl<A, DS> ServiceTrait for Service<A, DS>
+where
+    A: ServerApp<DS> + Send + Sync + 'static,
+    DS: CustomServerSession,
+{
     async fn start_service(
         &mut self,
         #[cfg(unix)] fds: Option<ListenFds>,
@@ -264,18 +361,14 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
     fn threads(&self) -> Option<usize> {
         self.threads
     }
-}
 
-use crate::apps::prometheus_http_app::PrometheusServer;
+    fn runtime_opts_override(&self, global: &RuntimeOpts) -> Option<RuntimeOpts> {
+        self.runtime_opts_override
+            .as_ref()
+            .and_then(|override_fn| override_fn(global))
+    }
 
-impl Service<PrometheusServer> {
-    /// The Prometheus HTTP server
-    ///
-    /// The HTTP server endpoint that reports Prometheus metrics collected in the entire service
-    pub fn prometheus_http_service() -> Self {
-        Service::new(
-            "Prometheus metric HTTP".to_string(),
-            PrometheusServer::new(),
-        )
+    fn listen_addresses(&self) -> Option<Vec<String>> {
+        Some(self.listeners.addresses())
     }
 }

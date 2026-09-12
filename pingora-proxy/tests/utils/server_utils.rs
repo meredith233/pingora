@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,21 +16,23 @@
 use super::cert;
 use async_trait::async_trait;
 use clap::Parser;
-use http::header::{ACCEPT_ENCODING, VARY};
+use http::header::{ACCEPT_ENCODING, CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING, UPGRADE, VARY};
 use http::HeaderValue;
 use log::error;
 use once_cell::sync::Lazy;
+use pingora_cache::admission::{AdmissionPolicy, Decision};
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::hashtable::ConcurrentHashTable;
 use pingora_cache::key::HashBinary;
 use pingora_cache::lock::CacheKeyLockImpl;
+use pingora_cache::storage::{HandleMiss, MissFinishType, Storage};
 use pingora_cache::{
     eviction::simple_lru::Manager, filters::resp_cacheable, lock::CacheLock, predictor::Predictor,
-    set_compression_dict_path, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason,
-    RespCacheable,
+    set_compression_dict_path, CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache,
+    NoCacheReason, RespCacheable,
 };
 use pingora_cache::{
-    CacheOptionOverrides, ForcedInvalidationKind, HitHandler, PurgeType, VarianceBuilder,
+    CacheOptionOverrides, ForcedFreshness, HitHandler, PurgeAction, PurgeType, VarianceBuilder,
 };
 use pingora_core::apps::{HttpServerApp, HttpServerOptions};
 use pingora_core::modules::http::compression::ResponseCompression;
@@ -38,16 +40,19 @@ use pingora_core::protocols::{
     http::error_resp::gen_error_response, l4::socket::SocketAddr, Digest,
 };
 use pingora_core::server::configuration::Opt;
-use pingora_core::services::Service;
-use pingora_core::upstreams::peer::HttpPeer;
+use pingora_core::services::{Service, ServiceWithDependents};
+use pingora_core::upstreams::peer::{H1UpgradePolicy, HttpPeer, HttpUpstreamRequestPolicy};
 use pingora_core::utils::tls::CertKey;
 use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_proxy::{FailToProxy, ProxyHttp, Session};
+use pingora_proxy::{FailToProxy, ProxyHttp, ProxyWarnLogContext, Session};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 pub struct ExampleProxyHttps {}
 
@@ -241,6 +246,16 @@ impl ProxyHttp for ExampleProxyHttps {
 
 pub struct ExampleProxyHttp {}
 
+static SUPPRESS_PROXY_WARN_LOG_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn reset_suppress_proxy_warn_log_calls() {
+    SUPPRESS_PROXY_WARN_LOG_CALLS.store(0, Ordering::Relaxed);
+}
+
+pub fn suppress_proxy_warn_log_calls() -> usize {
+    SUPPRESS_PROXY_WARN_LOG_CALLS.load(Ordering::Relaxed)
+}
+
 #[async_trait]
 impl ProxyHttp for ExampleProxyHttp {
     type CTX = CTX;
@@ -253,8 +268,19 @@ impl ProxyHttp for ExampleProxyHttp {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
-        let req = session.req_header();
-        let downstream_compression = req.headers.get("x-downstream-compression").is_some();
+        let proxy_tasks_enabled = session
+            .req_header()
+            .headers
+            .get("x-proxy-tasks-enabled")
+            .is_some();
+        if proxy_tasks_enabled {
+            session.downstream_session.set_proxy_tasks_enabled(true);
+        }
+        let downstream_compression = session
+            .req_header()
+            .headers
+            .get("x-downstream-compression")
+            .is_some();
         if downstream_compression {
             session
                 .downstream_modules_ctx
@@ -316,6 +342,73 @@ impl ProxyHttp for ExampleProxyHttp {
         response_filter_common(session, upstream_response, ctx)
     }
 
+    async fn request_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-upstream-discard-body")
+        {
+            *body = None;
+        }
+        Ok(())
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        session: &mut Session,
+        req: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        let host = session.get_header_bytes("host-override");
+        if !host.is_empty() {
+            req.insert_header("host", host)?;
+        }
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-upstream-delete-host")
+        {
+            req.remove_header(&http::header::HOST);
+        }
+
+        // Test-only hook: deliberately declare a larger outbound body than the valid
+        // downstream HTTP request contains. Built-in HTTP downstream parsing would reject
+        // a client that directly ended a shorter-than-declared body; this hook lets tests
+        // exercise defense in depth for downstream sessions that do not report incomplete
+        // body errors or upstream request mutations that reach that state.
+        if let Some(content_length) = session
+            .req_header()
+            .headers
+            .get("x-upstream-content-length")
+        {
+            req.insert_header(CONTENT_LENGTH, content_length.clone())?;
+            req.remove_header(&TRANSFER_ENCODING);
+        }
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-upstream-strip-framing")
+        {
+            req.remove_header(&CONTENT_LENGTH);
+            req.remove_header(&TRANSFER_ENCODING);
+        }
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-upstream-add-upgrade")
+        {
+            req.insert_header(CONNECTION, "Upgrade")?;
+            req.insert_header(UPGRADE, "websocket")?;
+        }
+        Ok(())
+    }
+
     async fn upstream_peer(
         &self,
         session: &mut Session,
@@ -346,6 +439,28 @@ impl ProxyHttp for ExampleProxyHttp {
             peer.options.set_http_version(2, 2);
         }
 
+        if req
+            .headers
+            .contains_key("x-preserve-upstream-request-headers")
+        {
+            peer.options.http_upstream_request_policy = HttpUpstreamRequestPolicy::preserve();
+        } else if req.headers.contains_key("x-preserve-upstream-upgrade") {
+            peer.options.http_upstream_request_policy.h1_upgrade = H1UpgradePolicy::Preserve;
+        } else if req.headers.contains_key("x-preserve-connection-nominated") {
+            peer.options
+                .http_upstream_request_policy
+                .strip_connection_nominated = false;
+        }
+
+        if let Some(ms) = req
+            .headers
+            .get("x-read-timeout-ms")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            peer.options.read_timeout = Some(std::time::Duration::from_millis(ms));
+        }
+
         Ok(peer)
     }
 
@@ -361,18 +476,102 @@ impl ProxyHttp for ExampleProxyHttp {
     ) -> Result<()> {
         connected_to_upstream_common(reused, digest, ctx)
     }
+
+    fn suppress_proxy_warn_log(
+        &self,
+        session: &Session,
+        _ctx: &Self::CTX,
+        _error: &Error,
+        context: ProxyWarnLogContext,
+    ) -> bool {
+        if session.get_header_bytes("x-test-suppress-proxy-warn-log") == b"true"
+            && context == ProxyWarnLogContext::UpstreamRetry
+        {
+            SUPPRESS_PROXY_WARN_LOG_CALLS.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
+static CACHE_FINISH_FAIL_BACKEND: FinishFailCache = FinishFailCache;
 const CACHE_DEFAULT: CacheMetaDefaults =
     CacheMetaDefaults::new(|_| Some(Duration::from_secs(1)), 1, 1);
 static CACHE_PREDICTOR: Lazy<Predictor<32>> = Lazy::new(|| Predictor::new(5, None));
 static EVICTION_MANAGER: Lazy<Manager> = Lazy::new(|| Manager::new(8192)); // 8192 bytes
 static CACHE_LOCK: Lazy<Box<CacheKeyLockImpl>> =
     Lazy::new(|| CacheLock::new_boxed(std::time::Duration::from_secs(2)));
+static DEFER_ADMISSION_POLICY: DeferAdmissionPolicy = DeferAdmissionPolicy;
 // Example of how one might restrict which fields can be varied on.
 static CACHE_VARY_ALLOWED_HEADERS: Lazy<Option<HashSet<&str>>> =
     Lazy::new(|| Some(vec!["accept", "accept-encoding"].into_iter().collect()));
+
+struct DeferAdmissionPolicy;
+
+impl AdmissionPolicy for DeferAdmissionPolicy {
+    fn observe(&self, _key: &CacheKey) -> Decision {
+        Decision::Defer { observed: 1 }
+    }
+}
+
+struct FinishFailCache;
+
+#[async_trait]
+impl Storage for FinishFailCache {
+    async fn lookup(
+        &'static self,
+        _key: &CacheKey,
+        _trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        Ok(None)
+    }
+
+    async fn get_miss_handler(
+        &'static self,
+        _key: &CacheKey,
+        _meta: &CacheMeta,
+        _trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<pingora_cache::MissHandler> {
+        Ok(Box::new(FinishFailMissHandler))
+    }
+
+    async fn purge(
+        &'static self,
+        _target: pingora_cache::PurgeTarget<'_>,
+        _purge_type: PurgeType,
+        _trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<pingora_cache::storage::PurgeOutcome> {
+        Ok(pingora_cache::storage::PurgeOutcome::NotFound)
+    }
+
+    async fn update_meta(
+        &'static self,
+        _key: &CacheKey,
+        _meta: &CacheMeta,
+        _trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync + 'static) {
+        self
+    }
+}
+
+struct FinishFailMissHandler;
+
+#[async_trait]
+impl HandleMiss for FinishFailMissHandler {
+    async fn write_body(&mut self, _data: bytes::Bytes, _eof: bool) -> Result<()> {
+        Ok(())
+    }
+
+    async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+        Error::e_explain(FileWriteError, "cache miss finalization failed")
+    }
+}
 
 // #[allow(clippy::upper_case_acronyms)]
 pub struct CacheCTX {
@@ -380,6 +579,17 @@ pub struct CacheCTX {
 }
 
 pub struct ExampleProxyCache {}
+
+static DOWNSTREAM_CACHE_WARN_LOG_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many times the cache proxy has reported a downstream error that it ignored in order
+/// to let a cache fill finish.
+///
+/// Tests use this to wait for the proxy to actually observe a downstream error instead of
+/// sleeping for an arbitrary duration.
+pub fn downstream_cache_warn_log_calls() -> usize {
+    DOWNSTREAM_CACHE_WARN_LOG_CALLS.load(Ordering::Relaxed)
+}
 
 #[async_trait]
 impl ProxyHttp for ExampleProxyCache {
@@ -465,13 +675,31 @@ impl ProxyHttp for ExampleProxyCache {
             .map(|_| CACHE_LOCK.as_ref());
         let mut overrides = CacheOptionOverrides::default();
         overrides.wait_timeout = Some(Duration::from_secs(2));
+        let storage = if session
+            .req_header()
+            .headers
+            .contains_key("x-cache-fail-finish")
+        {
+            &CACHE_FINISH_FAIL_BACKEND as &'static (dyn Storage + Sync)
+        } else {
+            &*CACHE_BACKEND as &'static (dyn Storage + Sync)
+        };
+
         session.cache.enable(
-            &*CACHE_BACKEND,
+            storage,
             eviction,
             Some(&*CACHE_PREDICTOR),
             lock,
             Some(overrides),
         );
+
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-defer-cache-admission")
+        {
+            session.cache.set_admission_policy(&DEFER_ADMISSION_POLICY);
+        }
 
         if let Some(max_file_size_hdr) = session
             .req_header()
@@ -489,6 +717,34 @@ impl ProxyHttp for ExampleProxyCache {
         Ok(())
     }
 
+    /// Reference `cache_key_callback` implementation for integration tests.
+    ///
+    /// Builds the primary key as `{host}{path_and_query}` from the request.
+    /// This is **not production ready**: it does not account for `Vary`, custom
+    /// request filters, or scheme differences. See the rustdoc on
+    /// [`ProxyHttp::cache_key_callback`] for details.
+    fn cache_key_callback(&self, session: &Session, _ctx: &mut Self::CTX) -> Result<CacheKey> {
+        let req_header = session.req_header();
+
+        let host = req_header
+            .headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| req_header.uri.authority().map(|a| a.as_str()))
+            .unwrap_or("");
+
+        let path_and_query = req_header
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+
+        Ok(CacheKey::new(
+            format!("{host}{path_and_query}"),
+            String::new(),
+        ))
+    }
+
     async fn cache_hit_filter(
         &self,
         session: &mut Session,
@@ -496,19 +752,34 @@ impl ProxyHttp for ExampleProxyCache {
         _hit_handler: &mut HitHandler,
         is_fresh: bool,
         _ctx: &mut Self::CTX,
-    ) -> Result<Option<ForcedInvalidationKind>> {
+    ) -> Result<Option<ForcedFreshness>> {
         // allow test header to control force expiry/miss
         if session.get_header_bytes("x-force-miss") != b"" {
-            return Ok(Some(ForcedInvalidationKind::ForceMiss));
+            return Ok(Some(ForcedFreshness::ForceMiss));
         }
 
         if !is_fresh {
+            if session.get_header_bytes("x-force-fresh") != b"" {
+                return Ok(Some(ForcedFreshness::ForceFresh));
+            }
             // already expired
             return Ok(None);
         }
 
         if session.get_header_bytes("x-force-expire") != b"" {
-            return Ok(Some(ForcedInvalidationKind::ForceExpired));
+            return Ok(Some(ForcedFreshness::ForceExpired));
+        }
+
+        if session.get_header_bytes("x-force-expire-serve-stale") != b"" {
+            // `x-expired-secs-ago` backdates the expiry, which is how a test reaches an
+            // asset whose serve stale window has already run out at the point it expired.
+            let secs_ago = std::str::from_utf8(session.get_header_bytes("x-expired-secs-ago"))
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            return Ok(Some(ForcedFreshness::ForceExpiredServeStale {
+                expired_at: SystemTime::now().checked_sub(Duration::from_secs(secs_ago)),
+            }));
         }
         Ok(None)
     }
@@ -571,10 +842,26 @@ impl ProxyHttp for ExampleProxyCache {
 
     fn response_cache_filter(
         &self,
-        _session: &Session,
+        session: &Session,
         resp: &ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<RespCacheable> {
+        // Allow testing the unlikely case of caching a 101 response
+        if resp.status == 101
+            && session
+                .req_header()
+                .headers
+                .contains_key("x-cache-websocket")
+        {
+            return Ok(RespCacheable::Cacheable(CacheMeta::new(
+                SystemTime::now() + Duration::from_secs(5),
+                SystemTime::now(),
+                0,
+                0,
+                resp.clone(),
+            )));
+        }
+
         let cc = CacheControl::from_resp_headers(resp);
         Ok(resp_cacheable(
             cc.as_ref(),
@@ -586,11 +873,27 @@ impl ProxyHttp for ExampleProxyCache {
 
     async fn upstream_response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         ctx.upstream_status = Some(upstream_response.status.into());
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-upstream-fake-http10")
+        {
+            // TODO to simulate an actual http1.0 origin
+            upstream_response.set_version(http::Version::HTTP_10);
+            upstream_response.remove_header(&CONTENT_LENGTH);
+            upstream_response.remove_header(&TRANSFER_ENCODING);
+        }
+        // Allow tests to inject Cache-Control into the upstream response
+        if let Some(cc) = session.req_header().headers.get("x-set-cache-control") {
+            upstream_response
+                .insert_header(http::header::CACHE_CONTROL, cc)
+                .unwrap();
+        }
         Ok(())
     }
 
@@ -693,11 +996,33 @@ impl ProxyHttp for ExampleProxyCache {
         error: Option<&Error>, // None when it is called during stale while revalidate
     ) -> bool {
         // enable serve stale while updating
-        error.map_or(true, |e| e.esource() == &ErrorSource::Upstream)
+        error.is_none_or(|e| e.esource() == &ErrorSource::Upstream)
     }
 
     fn is_purge(&self, session: &Session, _ctx: &Self::CTX) -> bool {
         session.req_header().method == "PURGE"
+    }
+
+    fn purge_action(&self, session: &Session, _ctx: &Self::CTX) -> PurgeAction {
+        if session.get_header_bytes("x-purge-action") == b"expire" {
+            PurgeAction::Expire
+        } else {
+            PurgeAction::Delete
+        }
+    }
+
+    fn suppress_proxy_warn_log(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+        _error: &Error,
+        context: ProxyWarnLogContext,
+    ) -> bool {
+        if context == ProxyWarnLogContext::DownstreamCache {
+            DOWNSTREAM_CACHE_WARN_LOG_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        // only observing, keep the logging behavior unchanged
+        false
     }
 }
 
@@ -709,7 +1034,8 @@ fn test_main() {
         "-c".into(),
         "tests/pingora_conf.yaml".into(),
     ];
-    let mut my_server = pingora_core::server::Server::new(Some(Opt::parse_from(opts))).unwrap();
+    let mut my_server =
+        pingora_core::server::Server::new(Some(Opt::parse_from_args(opts))).unwrap();
     my_server.bootstrap();
 
     let mut proxy_service_http =
@@ -717,6 +1043,14 @@ fn test_main() {
     proxy_service_http.add_tcp("0.0.0.0:6147");
     #[cfg(unix)]
     proxy_service_http.add_uds("/tmp/pingora_proxy.sock", None);
+
+    let mut proxy_service_http_connect =
+        pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp {});
+    let http_logic = proxy_service_http_connect.app_logic_mut().unwrap();
+    let mut http_server_options = HttpServerOptions::default();
+    http_server_options.allow_connect_method_proxying = true;
+    http_logic.server_options = Some(http_server_options);
+    proxy_service_http_connect.add_tcp("0.0.0.0:6160");
 
     let mut proxy_service_h2c =
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp {});
@@ -727,7 +1061,7 @@ fn test_main() {
     http_logic.server_options = Some(http_server_options);
     proxy_service_h2c.add_tcp("0.0.0.0:6146");
 
-    let mut proxy_service_https_opt: Option<Box<dyn Service>> = None;
+    let mut proxy_service_https_opt: Option<Box<dyn ServiceWithDependents>> = None;
 
     #[cfg(feature = "any_tls")]
     {
@@ -747,6 +1081,15 @@ fn test_main() {
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyCache {});
     proxy_service_cache.add_tcp("0.0.0.0:6148");
 
+    // H2C-enabled cache proxy on port 6154
+    let mut proxy_service_cache_h2c =
+        pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyCache {});
+    let cache_h2c_logic = proxy_service_cache_h2c.app_logic_mut().unwrap();
+    let mut cache_h2c_options = HttpServerOptions::default();
+    cache_h2c_options.h2c = true;
+    cache_h2c_logic.server_options = Some(cache_h2c_options);
+    proxy_service_cache_h2c.add_tcp("0.0.0.0:6154");
+
     #[cfg(feature = "any_tls")]
     {
         let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
@@ -758,10 +1101,12 @@ fn test_main() {
         proxy_service_cache.add_tls_with_settings("0.0.0.0:6153", None, tls_settings);
     }
 
-    let mut services: Vec<Box<dyn Service>> = vec![
+    let mut services: Vec<Box<dyn ServiceWithDependents>> = vec![
         Box::new(proxy_service_h2c),
         Box::new(proxy_service_http),
+        Box::new(proxy_service_http_connect),
         Box::new(proxy_service_cache),
+        Box::new(proxy_service_cache_h2c),
     ];
 
     if let Some(proxy_service_https) = proxy_service_https_opt {
@@ -782,6 +1127,18 @@ impl Server {
         let server_handle = thread::spawn(|| {
             test_main();
         });
+        let addr = "127.0.0.1:6147".parse().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test proxy failed to start within 10s"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
         Server {
             handle: server_handle,
         }
@@ -796,16 +1153,28 @@ pub struct PskTlsServer {
 #[cfg(feature = "s2n")]
 impl PskTlsServer {
     pub fn start() -> Self {
-        let server_handle = thread::spawn(|| {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Use a channel to wait for the server to bind its port.
+        // A TCP probe can't be used here because the TLS acceptor would
+        // try to handshake the probe connection, fail, and panic.
+        let (tx, rx) = mpsc::channel();
+        let server_handle = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(Self::run_server());
+            rt.block_on(Self::run_server(tx));
         });
+
+        // Wait up to 10s for the server to signal it has bound the port.
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("PSK TLS server failed to start within 10s");
+
         PskTlsServer {
             handle: server_handle,
         }
     }
 
-    async fn run_server() {
+    async fn run_server(ready_tx: std::sync::mpsc::Sender<()>) {
         use pingora_core::{protocols::tls::S2NConnectionBuilder, tls::TlsAcceptor};
         use pingora_core::{
             protocols::tls::{Psk, PskConfig, PskType},
@@ -822,6 +1191,8 @@ impl PskTlsServer {
 
         let addr: std::net::SocketAddr = "127.0.0.1:6151".parse().unwrap();
         let listener = TcpListener::bind(addr).await.unwrap();
+        let _ = ready_tx.send(()); // signal: port is bound
+
         let mut config_builder = Config::builder();
         unsafe {
             config_builder.disable_x509_verification();
@@ -838,12 +1209,20 @@ impl PskTlsServer {
         let acceptor = TlsAcceptor::new(connection_builder);
 
         loop {
-            use tokio::{io::AsyncWriteExt, net::tcp};
+            use tokio::io::AsyncWriteExt;
             let (tcp_stream, _) = listener.accept().await.unwrap();
-            let mut stream = acceptor.clone().accept(tcp_stream).await.unwrap();
+            // Don't panic on handshake failure — a stale connection or probe
+            // shouldn't take down the server for subsequent real connections.
+            let mut stream = match acceptor.clone().accept(tcp_stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("PSK TLS server: handshake failed: {e}");
+                    continue;
+                }
+            };
             let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-            stream.write(response).await.unwrap();
-            stream.shutdown().await;
+            let _ = stream.write_all(response).await;
+            let _ = stream.shutdown().await;
         }
     }
 }
@@ -853,6 +1232,14 @@ pub static TEST_SERVER: Lazy<Server> = Lazy::new(Server::start);
 #[cfg(feature = "s2n")]
 pub static TEST_PSK_TLS_SERVER: Lazy<PskTlsServer> = Lazy::new(PskTlsServer::start);
 use super::mock_origin::MOCK_ORIGIN;
+
+pub async fn init_proxy() {
+    tokio::task::spawn_blocking(|| {
+        let _ = *TEST_SERVER;
+    })
+    .await
+    .expect("test proxy startup task panicked");
+}
 
 pub fn init() {
     let _ = *TEST_SERVER;
